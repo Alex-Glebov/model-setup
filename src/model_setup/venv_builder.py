@@ -60,6 +60,11 @@ class VenvBuilder:
         logger.info("Venv Builder - Test Before Commit")
         logger.info("=" * 60)
 
+        # Preserve existing venv as venv.orig if it exists
+        if self.venv_path.exists():
+            orig_path = self._rename_to_orig()
+            logger.info(f"Renamed existing venv to {orig_path}")
+
         # Build installation priority queue
         install_queue = self._build_install_queue()
         logger.info(f"Installation queue: {install_queue}")
@@ -200,6 +205,28 @@ class VenvBuilder:
                         break
         except:
             pass
+
+    def _rename_to_orig(self) -> Path:
+        """Rename existing venv to venv.orig.
+
+        Returns:
+            Path to renamed venv
+        """
+        # Close any logging first
+        self._cleanup_logging()
+
+        # Find unique orig path
+        orig_path = self.venv_path.parent / f"{self.venv_path.name}.orig"
+        counter = 1
+        while orig_path.exists():
+            orig_path = self.venv_path.parent / f"{self.venv_path.name}.orig.{counter}"
+            counter += 1
+
+        # Rename venv
+        shutil.move(str(self.venv_path), str(orig_path))
+        logger.info(f"Renamed existing venv to {orig_path}")
+
+        return orig_path
 
     def _archive_venv(self, suffix: str, failed: bool = False) -> Path:
         """Archive venv by renaming it.
