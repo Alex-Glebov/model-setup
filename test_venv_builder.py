@@ -18,9 +18,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Create ML venv for detected hardware')
     parser.add_argument('venv_path', help='Path to create venv')
     parser.add_argument('--config', help='Path to write hardware config JSON')
+    parser.add_argument('--on-fail', choices=['a', 'y', 'n'], default='n',
+                        help='Action on failed install: a=auto-delete, y=ask, n=keep (default)')
     args = parser.parse_args()
 
-    venv, hardware = create_venv_for_hardware(args.venv_path, args.config)
+    venv, hardware = create_venv_for_hardware(args.venv_path, args.config, args.on_fail)
 
     print(f"\n✓ Virtual environment created at: {venv}")
     print(f"  Hardware: {hardware.gpu_type or 'CPU-only'}")
