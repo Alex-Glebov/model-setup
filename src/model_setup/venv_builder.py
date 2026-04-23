@@ -48,7 +48,11 @@ class VenvBuilder:
     def pip_path(self) -> Path:
         """Get path to venv's pip executable."""
         if self._pip_path is None:
-            self._pip_path = self.venv_path / 'bin' / 'pip'
+            # Windows uses Scripts\pip.exe, Unix uses bin/pip
+            if platform.system() == 'Windows':
+                self._pip_path = self.venv_path / 'Scripts' / 'pip.exe'
+            else:
+                self._pip_path = self.venv_path / 'bin' / 'pip'
         return self._pip_path
 
     def create(self) -> Path:

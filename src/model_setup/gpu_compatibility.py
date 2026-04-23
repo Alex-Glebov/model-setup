@@ -8,11 +8,26 @@ Catches issues like:
 """
 
 import logging
+import platform
 import subprocess
 import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _get_python_path(venv_path: Path) -> Path:
+    """Get Python executable path for venv (platform-aware).
+
+    Args:
+        venv_path: Path to venv
+
+    Returns:
+        Path to Python executable
+    """
+    if platform.system() == 'Windows':
+        return venv_path / 'Scripts' / 'python.exe'
+    return venv_path / 'bin' / 'python'
 
 
 def test_gpu_compatibility(venv_path: Path, timeout: int = 60) -> tuple[bool, str]:
@@ -29,7 +44,7 @@ def test_gpu_compatibility(venv_path: Path, timeout: int = 60) -> tuple[bool, st
     Returns:
         (success, message) tuple
     """
-    python_path = venv_path / 'bin' / 'python'
+    python_path = _get_python_path(venv_path)
 
     if not python_path.exists():
         return False, f"Python not found at {python_path}"
@@ -138,7 +153,7 @@ def test_cpu_compatibility(venv_path: Path, timeout: int = 30) -> tuple[bool, st
     Returns:
         (success, message) tuple
     """
-    python_path = venv_path / 'bin' / 'python'
+    python_path = _get_python_path(venv_path)
 
     test_script = '''
 import torch
