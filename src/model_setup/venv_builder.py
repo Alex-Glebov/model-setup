@@ -511,7 +511,7 @@ def create_venv_for_hardware(
     return venv, hardware_info, keras_backend
 
 
-def _generate_keras_backend_py(venv_path: Path, keras_backend: str):
+def _generate_keras_backend_py(venv_path, keras_backend: str):
     """Generate keras_backend.py for model-core package.
 
     This file sets KERAS_BACKEND environment variable before importing keras.
@@ -522,7 +522,7 @@ def _generate_keras_backend_py(venv_path: Path, keras_backend: str):
         keras_backend: Keras backend name from config['keras_backend']
     """
     # Find model_core directory in the venv's parent (assumes model-core is checked out there)
-    model_core_parent = venv_path.parent
+    model_core_parent = Path(venv_path).parent
     keras_backend_path = model_core_parent / 'model_core' / 'keras_backend.py'
 
     content = f'''\"\"\"Keras backend initialization.
