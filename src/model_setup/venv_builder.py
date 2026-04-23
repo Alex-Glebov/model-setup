@@ -579,4 +579,7 @@ if __name__ == '__main__':
     print(f"  GPU: {hardware.gpu_name or 'N/A'}")
     print(f"  Keras Backend: {keras_backend}")
     print(f"\nTo activate:")
-    print(f"  source {venv}/bin/activate")
+    if platform.system() == 'Windows':
+        print(f"  {venv}\\Scripts\\activate")
+    else:
+        print(f"  source {venv}/bin/activate")
