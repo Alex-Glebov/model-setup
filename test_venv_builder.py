@@ -22,10 +22,13 @@ if __name__ == '__main__':
                         help='Action on failed install: a=auto-delete, y=ask, n=keep (default)')
     args = parser.parse_args()
 
-    venv, hardware = create_venv_for_hardware(args.venv_path, args.config, args.on_fail)
+    venv, hardware, keras_backend = create_venv_for_hardware(
+        args.venv_path, args.config, args.on_fail
+    )
 
     print(f"\n✓ Virtual environment created at: {venv}")
     print(f"  Hardware: {hardware.gpu_type or 'CPU-only'}")
     print(f"  GPU: {hardware.gpu_name or 'N/A'}")
+    print(f"  Keras Backend: {keras_backend}")
     print(f"\nTo activate:")
     print(f"  source {venv}/bin/activate")
