@@ -15,6 +15,7 @@ from typing import Optional
 
 from .hardware_detector import HardwareDetector, HardwareInfo
 from .gpu_compatibility import test_gpu_compatibility, test_cpu_compatibility
+from .pip_version_checker import can_install_backend
 
 logger = logging.getLogger(__name__)
 
@@ -110,29 +111,46 @@ class VenvBuilder:
         raise RuntimeError("All installation options failed including CPU")
 
     def _build_install_queue(self) -> list[str]:
-        """Build installation priority queue based on detected hardware."""
+        """Build installation priority queue based on detected hardware.
+
+        Filters by PyPI availability - only includes backends that can be installed.
+        """
         queue = []
 
         if not self.hardware_info:
-            queue.append('cpu')
+            # Check if CPU backend is available on PyPI
+            can_install, _ = can_install_backend('torch')
+            if can_install:
+                queue.append('cpu')
             return queue
 
         gpu_type = self.hardware_info.gpu_type
 
+        # Map hardware to preferred Keras 3.x backend
+        # Priority: GPU backends first
         if gpu_type == 'jetson':
-            # Jetson has special PyTorch wheel
-            queue.append('jetson')
+            # Jetson works best with torch backend
+            can_install, _ = can_install_backend('torch')
+            if can_install:
+                queue.append('jetson')
 
         elif gpu_type == 'cuda':
-            # CUDA is preferred (best performance, most stable)
-            queue.append('cuda')
+            # CUDA works with torch or tensorflow
+            for backend in ['torch', 'tensorflow']:
+                can_install, _ = can_install_backend(backend)
+                if can_install:
+                    queue.append(backend)
 
         elif gpu_type == 'rocm':
-            # ROCm is supported but may have issues
-            queue.append('rocm')
+            # ROCm works best with torch
+            can_install, _ = can_install_backend('torch')
+            if can_install:
+                queue.append('rocm')
 
-        # CPU always last as guaranteed fallback
-        queue.append('cpu')
+        # CPU fallback using torch (lightest weight)
+        can_install, _ = can_install_backend('torch')
+        if can_install:
+            queue.append('cpu')
 
         return queue
 
@@ -299,7 +317,7 @@ class VenvBuilder:
             raise ValueError(f"Unknown install type: {install_type}")
 
     def _install_pytorch_jetson(self):
-        """Install PyTorch for Jetson."""
+        """Install PyTorch + Keras for Jetson."""
         jetpack_version = self._get_jetpack_version()
         logger.info(f"Detected JetPack: {jetpack_version}")
 
@@ -317,8 +335,15 @@ class VenvBuilder:
         )
         logger.info("PyTorch (Jetson) installed")
 
+        # Install Keras 3.x
+        subprocess.run(
+            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            check=True
+        )
+        logger.info("Keras installed")
+
     def _install_pytorch_cuda(self):
-        """Install PyTorch for CUDA."""
+        """Install PyTorch + Keras for CUDA."""
         subprocess.run(
             [str(self.pip_path), 'install', 'torch', 'torchvision',
              '--index-url', 'https://download.pytorch.org/whl/cu121'],
@@ -326,8 +351,15 @@ class VenvBuilder:
         )
         logger.info("PyTorch (CUDA) installed")
 
+        # Install Keras 3.x
+        subprocess.run(
+            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            check=True
+        )
+        logger.info("Keras installed")
+
     def _install_pytorch_rocm(self):
-        """Install PyTorch for ROCm."""
+        """Install PyTorch + Keras for ROCm."""
         subprocess.run(
             [str(self.pip_path), 'install', 'torch', 'torchvision',
              '--index-url', 'https://download.pytorch.org/whl/rocm5.7'],
@@ -335,14 +367,28 @@ class VenvBuilder:
         )
         logger.info("PyTorch (ROCm) installed")
 
+        # Install Keras 3.x
+        subprocess.run(
+            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            check=True
+        )
+        logger.info("Keras installed")
+
     def _install_pytorch_cpu(self):
-        """Install PyTorch for CPU."""
+        """Install PyTorch + Keras for CPU."""
         subprocess.run(
             [str(self.pip_path), 'install', 'torch', 'torchvision',
              '--index-url', 'https://download.pytorch.org/whl/cpu'],
             check=True
         )
         logger.info("PyTorch (CPU) installed")
+
+        # Install Keras 3.x
+        subprocess.run(
+            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            check=True
+        )
+        logger.info("Keras installed")
 
     def _install_remaining_deps(self):
         """Install remaining packages from requirements.txt."""
@@ -417,7 +463,7 @@ def create_venv_for_hardware(
     venv_path: str,
     output_config_path: Optional[str] = None,
     on_fail: str = 'n'
-) -> tuple[Path, HardwareInfo]:
+) -> tuple[Path, HardwareInfo, str]:
     """Create venv configured for detected hardware.
 
     Args:
@@ -426,7 +472,7 @@ def create_venv_for_hardware(
         on_fail: Action on failed install - 'a'=auto-delete, 'y'=ask, 'n'=keep
 
     Returns:
-        (venv_path, hardware_info)
+        (venv_path, hardware_info, keras_backend)
     """
     # Detect hardware
     detector = HardwareDetector()
@@ -436,16 +482,30 @@ def create_venv_for_hardware(
     builder = VenvBuilder(venv_path, hardware_info, on_fail=on_fail)
     venv = builder.create()
 
-    # Write hardware config
+    # Determine keras_backend from hardware_info
+    # Map hardware detector's preferred_backend to Keras 3.x backend names
+    keras_backend_map = {
+        'pytorch': 'torch',
+        'tensorflow': 'tensorflow',
+        'cpu': 'torch',  # Default to torch for CPU
+    }
+    keras_backend = keras_backend_map.get(hardware_info.preferred_backend, 'torch')
+
+    # Write hardware config with keras_backend
     if output_config_path:
         import json
         config_path = Path(output_config_path)
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(config_path, 'w') as f:
-            json.dump(hardware_info.to_dict(), f, indent=2)
-        logger.info(f"Hardware config written to {config_path}")
 
-    return venv, hardware_info
+        config = hardware_info.to_dict()
+        config['keras_backend'] = keras_backend
+
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        logger.info(f"Hardware config written to {config_path}")
+        logger.info(f"Keras backend: {keras_backend}")
+
+    return venv, hardware_info, keras_backend
 
 
 if __name__ == '__main__':
@@ -463,10 +523,13 @@ if __name__ == '__main__':
                         help='Action on failed install: a=auto-delete, y=ask, n=keep (default)')
     args = parser.parse_args()
 
-    venv, hardware = create_venv_for_hardware(args.venv_path, args.config, args.on_fail)
+    venv, hardware, keras_backend = create_venv_for_hardware(
+        args.venv_path, args.config, args.on_fail
+    )
 
     print(f"\n✓ Virtual environment created at: {venv}")
     print(f"  Hardware: {hardware.gpu_type or 'CPU-only'}")
     print(f"  GPU: {hardware.gpu_name or 'N/A'}")
+    print(f"  Keras Backend: {keras_backend}")
     print(f"\nTo activate:")
     print(f"  source {venv}/bin/activate")
