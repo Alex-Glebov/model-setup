@@ -35,14 +35,17 @@ class VenvBuilder:
         self,
         venv_path: str,
         hardware_info: Optional[HardwareInfo] = None,
-        on_fail: str = 'n'  # 'a'=auto-delete, 'y'=ask, 'n'=keep
+        on_fail: str = 'n',  # 'a'=auto-delete, 'y'=ask, 'n'=keep
+        install_all: bool = False  # Install all working backends
     ):
         self.venv_path = Path(venv_path)
         self.hardware_info = hardware_info
         self.on_fail = on_fail
+        self.install_all = install_all
         self._pip_path: Optional[Path] = None
         self._log_file: Optional[Path] = None
         self._file_handler: Optional[logging.FileHandler] = None
+        self._successful_backends: list[tuple[str, str]] = []  # (backend_name, install_type)
 
     @property
     def pip_path(self) -> Path:
@@ -55,14 +58,17 @@ class VenvBuilder:
                 self._pip_path = self.venv_path / 'bin' / 'pip'
         return self._pip_path
 
-    def create(self) -> Path:
+    def create(self) -> tuple[Path, list[tuple[str, str]]]:
         """Create virtual environment with test-before-commit.
 
         Returns:
-            Path to created venv
+            (venv_path, successful_backends) where successful_backends is
+            list of (backend_name, install_type) tuples for all working backends
         """
         logger.info("=" * 60)
         logger.info("Venv Builder - Test Before Commit")
+        if self.install_all:
+            logger.info("Mode: Install ALL working backends (--all)")
         logger.info("=" * 60)
 
         # Preserve existing venv as venv.orig if it exists
@@ -74,23 +80,27 @@ class VenvBuilder:
         install_queue = self._build_install_queue()
         logger.info(f"Installation queue: {install_queue}")
 
-        # Try each variant until one passes
-        for install_type in install_queue:
-            logger.info(f"\nTrying {install_type.upper()}...")
+        # Track successful backends for --all mode
+        self._successful_backends = []
+        primary_venv = None
+
+        # Try each variant
+        for backend_name, install_type in install_queue:
+            logger.info(f"\nTrying {backend_name} ({install_type})...")
 
             # Archive any existing venv from previous attempt
             if self.venv_path.exists():
-                self._archive_venv(install_type, failed=True)
+                self._archive_venv(f"{backend_name}-{install_type}", failed=True)
 
             # Create fresh venv with logging
             self._create_venv(self.venv_path)
 
-            # Install PyTorch variant
+            # Install ML backend variant
             try:
-                self._install_pytorch(install_type)
+                self._install_pytorch(install_type, backend_name)
             except Exception as e:
                 logger.error(f"Install failed: {e}")
-                self._archive_venv(f"{install_type}-install-failed")
+                self._archive_venv(f"{backend_name}-{install_type}-install-failed")
                 continue
 
             # TEST: Verify GPU actually works
@@ -98,25 +108,47 @@ class VenvBuilder:
             success, msg = self._test_installation(install_type)
 
             if success:
-                logger.info(f"✓ {install_type} PASSED: {msg}")
+                logger.info(f"✓ {backend_name} ({install_type}) PASSED: {msg}")
+                self._successful_backends.append((backend_name, install_type))
                 self._install_remaining_deps()
-                self._cleanup_logging()
 
-                # Optionally archive successful attempts
-                # self._cleanup_archives(keep_last=1)
-
-                return self.venv_path
+                if not self.install_all:
+                    # Single install mode: return first success
+                    self._cleanup_logging()
+                    return self.venv_path, self._successful_backends
+                else:
+                    # --all mode: save as primary if first success, then continue
+                    if primary_venv is None:
+                        primary_venv = self.venv_path
+                        # Rename to indicate it's the primary
+                        primary_path = self.venv_path.parent / f"{self.venv_path.name}-primary"
+                        shutil.move(str(self.venv_path), str(primary_path))
+                        primary_venv = primary_path
+                        logger.info(f"Saved primary backend to {primary_path}")
+                    else:
+                        # Archive additional successful backends
+                        alt_path = self.venv_path.parent / f"{self.venv_path.name}-{backend_name}"
+                        shutil.move(str(self.venv_path), str(alt_path))
+                        logger.info(f"Saved alternative backend to {alt_path}")
             else:
-                logger.warning(f"✗ {install_type} FAILED: {msg}")
-                archive_path = self._archive_venv(f"{install_type}-failed")
+                logger.warning(f"✗ {backend_name} ({install_type}) FAILED: {msg}")
+                archive_path = self._archive_venv(f"{backend_name}-{install_type}-failed")
                 self._handle_failure(archive_path, install_type)
+
+        self._cleanup_logging()
+
+        if primary_venv or self._successful_backends:
+            # Return primary venv (or first successful if not in --all mode)
+            venv_to_return = primary_venv if primary_venv else self.venv_path
+            return venv_to_return, self._successful_backends
 
         # Should never reach here (CPU always works)
         raise RuntimeError("All installation options failed including CPU")
 
-    def _build_install_queue(self) -> list[str]:
+    def _build_install_queue(self) -> list[tuple[str, str]]:
         """Build installation priority queue based on detected hardware.
 
+        Returns list of (backend_name, install_type) tuples.
         Filters by PyPI availability - only includes backends that can be installed.
         """
         queue = []
@@ -125,36 +157,41 @@ class VenvBuilder:
             # Check if CPU backend is available on PyPI
             can_install, _ = can_install_backend('torch')
             if can_install:
-                queue.append('cpu')
+                queue.append(('torch', 'cpu'))
             return queue
 
         gpu_type = self.hardware_info.gpu_type
 
-        # Map hardware to preferred Keras 3.x backend
+        # Map hardware to (backend_name, install_type) tuples
         # Priority: GPU backends first
         if gpu_type == 'jetson':
             # Jetson works best with torch backend
             can_install, _ = can_install_backend('torch')
             if can_install:
-                queue.append('jetson')
+                queue.append(('torch', 'jetson'))
 
         elif gpu_type == 'cuda':
-            # CUDA works with torch or tensorflow
-            for backend in ['torch', 'tensorflow']:
-                can_install, _ = can_install_backend(backend)
-                if can_install:
-                    queue.append(backend)
+            # CUDA works with torch - use 'cuda' install type
+            can_install_torch, _ = can_install_backend('torch')
+            if can_install_torch:
+                queue.append(('torch', 'cuda'))
+
+            # If --all, also try tensorflow
+            if self.install_all:
+                can_install_tf, _ = can_install_backend('tensorflow')
+                if can_install_tf:
+                    queue.append(('tensorflow', 'cuda'))
 
         elif gpu_type == 'rocm':
             # ROCm works best with torch
             can_install, _ = can_install_backend('torch')
             if can_install:
-                queue.append('rocm')
+                queue.append(('torch', 'rocm'))
 
         # CPU fallback using torch (lightest weight)
         can_install, _ = can_install_backend('torch')
         if can_install:
-            queue.append('cpu')
+            queue.append(('torch', 'cpu'))
 
         return queue
 
@@ -305,18 +342,29 @@ class VenvBuilder:
         else:
             return test_gpu_compatibility(self.venv_path)
 
-    def _install_pytorch(self, install_type: str):
-        """Install PyTorch variant."""
-        logger.info(f"Installing PyTorch ({install_type})...")
+    def _install_pytorch(self, install_type: str, backend_name: str = 'torch'):
+        """Install ML backend variant.
+
+        Args:
+            install_type: 'cuda', 'rocm', 'cpu', 'jetson'
+            backend_name: 'torch' or 'tensorflow'
+        """
+        logger.info(f"Installing {backend_name} ({install_type})...")
 
         if install_type == 'jetson':
             self._install_pytorch_jetson()
         elif install_type == 'cuda':
-            self._install_pytorch_cuda()
+            if backend_name == 'tensorflow':
+                self._install_tensorflow_cuda()
+            else:
+                self._install_pytorch_cuda()
         elif install_type == 'rocm':
             self._install_pytorch_rocm()
         elif install_type == 'cpu':
-            self._install_pytorch_cpu()
+            if backend_name == 'tensorflow':
+                self._install_tensorflow_cpu()
+            else:
+                self._install_pytorch_cpu()
         else:
             raise ValueError(f"Unknown install type: {install_type}")
 
@@ -388,6 +436,36 @@ class VenvBuilder:
         logger.info("PyTorch (CPU) installed")
 
         # Install Keras 3.x
+        subprocess.run(
+            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            check=True
+        )
+        logger.info("Keras installed")
+
+    def _install_tensorflow_cuda(self):
+        """Install TensorFlow + Keras for CUDA."""
+        subprocess.run(
+            [str(self.pip_path), 'install', 'tensorflow[and-cuda]'],
+            check=True
+        )
+        logger.info("TensorFlow (CUDA) installed")
+
+        # Keras is included with TensorFlow, but ensure >=3.0
+        subprocess.run(
+            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            check=True
+        )
+        logger.info("Keras installed")
+
+    def _install_tensorflow_cpu(self):
+        """Install TensorFlow + Keras for CPU."""
+        subprocess.run(
+            [str(self.pip_path), 'install', 'tensorflow-cpu'],
+            check=True
+        )
+        logger.info("TensorFlow (CPU) installed")
+
+        # Keras is included with TensorFlow, but ensure >=3.0
         subprocess.run(
             [str(self.pip_path), 'install', 'keras>=3.0.0'],
             check=True
@@ -466,34 +544,41 @@ class VenvBuilder:
 def create_venv_for_hardware(
     venv_path: str,
     output_config_path: Optional[str] = None,
-    on_fail: str = 'n'
-) -> tuple[Path, HardwareInfo, str]:
+    on_fail: str = 'n',
+    install_all: bool = False
+) -> tuple[Path, HardwareInfo, str, list[tuple[str, str]]]:
     """Create venv configured for detected hardware.
 
     Args:
         venv_path: Where to create venv
         output_config_path: Where to write hardware config JSON (optional)
         on_fail: Action on failed install - 'a'=auto-delete, 'y'=ask, 'n'=keep
+        install_all: If True, install all working backends (not just priority)
 
     Returns:
-        (venv_path, hardware_info, keras_backend)
+        (venv_path, hardware_info, keras_backend, all_successful_backends)
     """
     # Detect hardware
     detector = HardwareDetector()
     hardware_info = detector.detect()
 
     # Create venv with test-before-commit
-    builder = VenvBuilder(venv_path, hardware_info, on_fail=on_fail)
-    venv = builder.create()
+    builder = VenvBuilder(venv_path, hardware_info, on_fail=on_fail, install_all=install_all)
+    venv, successful_backends = builder.create()
 
-    # Determine keras_backend from hardware_info
-    # Map hardware detector's preferred_backend to Keras 3.x backend names
+    # Determine primary keras_backend from successful installs or hardware_info
     keras_backend_map = {
         'pytorch': 'torch',
         'tensorflow': 'tensorflow',
-        'cpu': 'torch',  # Default to torch for CPU
+        'cpu': 'torch',
     }
-    keras_backend = keras_backend_map.get(hardware_info.preferred_backend, 'torch')
+
+    if successful_backends:
+        # Use first successful backend as primary
+        keras_backend = successful_backends[0][0]
+    else:
+        # Fallback to hardware detection
+        keras_backend = keras_backend_map.get(hardware_info.preferred_backend, 'torch')
 
     # Write hardware config with keras_backend
     if output_config_path:
@@ -503,42 +588,71 @@ def create_venv_for_hardware(
 
         config = hardware_info.to_dict()
         config['keras_backend'] = keras_backend
+        config['available_backends'] = [b[0] for b in successful_backends]
 
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=2)
         logger.info(f"Hardware config written to {config_path}")
-        logger.info(f"Keras backend: {keras_backend}")
+        logger.info(f"Primary Keras backend: {keras_backend}")
+        if len(successful_backends) > 1:
+            logger.info(f"Alternative backends available: {[b[0] for b in successful_backends[1:]]}")
 
-    # Generate keras_backend.py for model-core
-    _generate_keras_backend_py(venv_path, keras_backend)
+    # Generate keras_backend.py for model-core with all available backends
+    _generate_keras_backend_py(venv_path, keras_backend, successful_backends)
 
-    return venv, hardware_info, keras_backend
+    return venv, hardware_info, keras_backend, successful_backends
 
 
-def _generate_keras_backend_py(venv_path, keras_backend: str):
+def _generate_keras_backend_py(
+    venv_path,
+    primary_backend: str,
+    all_backends: list[tuple[str, str]] = None
+):
     """Generate keras_backend.py for model-core package.
 
     This file sets KERAS_BACKEND environment variable before importing keras.
     Other modules import keras from here instead of directly.
 
+    When multiple backends are available, generates commented lines for easy switching.
+
     Args:
         venv_path: Path to venv (contains model-core checkout)
-        keras_backend: Keras backend name from config['keras_backend']
+        primary_backend: Primary Keras backend name to use by default
+        all_backends: List of (backend_name, install_type) tuples for all working backends
     """
     # Find model_core directory in the venv's parent (assumes model-core is checked out there)
     model_core_parent = Path(venv_path).parent
     keras_backend_path = model_core_parent / 'model_core' / 'keras_backend.py'
 
+    # Build the backend configuration lines
+    backend_lines = []
+
+    # Primary backend (active)
+    backend_lines.append(f'# Active backend: {primary_backend}')
+    backend_lines.append(f'os.environ["KERAS_BACKEND"] = "{primary_backend}"')
+
+    # Add commented alternatives if --all mode was used
+    if all_backends and len(all_backends) > 1:
+        backend_lines.append('')
+        backend_lines.append('# Alternative backends (uncomment to switch):')
+
+        for backend_name, install_type in all_backends:
+            if backend_name != primary_backend:
+                backend_lines.append(f'# Backend: {backend_name} ({install_type})')
+                backend_lines.append(f'# os.environ["KERAS_BACKEND"] = "{backend_name}"')
+
+    backend_config = '\n'.join(backend_lines)
+
     content = f'''\"\"\"Keras backend initialization.
 
 Auto-generated by model-setup. Do not edit manually.
-Backend: {keras_backend}
+Primary backend: {primary_backend}
 \"\"\"
 
 import os
 
 # Set Keras backend BEFORE importing keras
-os.environ["KERAS_BACKEND"] = "{keras_backend}"
+{backend_config}
 
 # Import keras with configured backend
 import keras
@@ -551,6 +665,9 @@ __all__ = ["keras"]
         with open(keras_backend_path, 'w') as f:
             f.write(content)
         logger.info(f"Generated {keras_backend_path}")
+        if all_backends and len(all_backends) > 1:
+            logger.info(f"Available backends: {[b[0] for b in all_backends]}")
+            logger.info(f"Switch backends by editing: {keras_backend_path}")
     except Exception as e:
         logger.warning(f"Could not generate keras_backend.py: {e}")
 
@@ -568,16 +685,26 @@ if __name__ == '__main__':
     parser.add_argument('--config', help='Path to write hardware config JSON')
     parser.add_argument('--on-fail', choices=['a', 'y', 'n'], default='n',
                         help='Action on failed install: a=auto-delete, y=ask, n=keep (default)')
+    parser.add_argument('--all', action='store_true', dest='install_all',
+                        help='Install ALL working backends with commented switch options')
     args = parser.parse_args()
 
-    venv, hardware, keras_backend = create_venv_for_hardware(
-        args.venv_path, args.config, args.on_fail
+    venv, hardware, keras_backend, all_backends = create_venv_for_hardware(
+        args.venv_path, args.config, args.on_fail, args.install_all
     )
 
     print(f"\n✓ Virtual environment created at: {venv}")
     print(f"  Hardware: {hardware.gpu_type or 'CPU-only'}")
     print(f"  GPU: {hardware.gpu_name or 'N/A'}")
-    print(f"  Keras Backend: {keras_backend}")
+    print(f"  Primary Keras Backend: {keras_backend}")
+
+    if len(all_backends) > 1:
+        print(f"\n  Available backends:")
+        for i, (backend_name, install_type) in enumerate(all_backends):
+            marker = " (active)" if i == 0 else ""
+            print(f"    - {backend_name} ({install_type}){marker}")
+        print(f"\n  Switch backends by editing: model_core/keras_backend.py")
+
     print(f"\nTo activate:")
     if platform.system() == 'Windows':
         print(f"  {venv}\\Scripts\\activate")
