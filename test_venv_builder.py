@@ -21,16 +21,25 @@ if __name__ == '__main__':
     parser.add_argument('--config', help='Path to write hardware config JSON')
     parser.add_argument('--on-fail', choices=['a', 'y', 'n'], default='n',
                         help='Action on failed install: a=auto-delete, y=ask, n=keep (default)')
+    parser.add_argument('--all', action='store_true', dest='install_all',
+                        help='Install ALL working backends with commented switch options')
     args = parser.parse_args()
 
-    venv, hardware, keras_backend = create_venv_for_hardware(
-        args.venv_path, args.config, args.on_fail
+    venv, hardware, keras_backend, all_backends = create_venv_for_hardware(
+        args.venv_path, args.config, args.on_fail, args.install_all
     )
 
     print(f"\n✓ Virtual environment created at: {venv}")
     print(f"  Hardware: {hardware.gpu_type or 'CPU-only'}")
     print(f"  GPU: {hardware.gpu_name or 'N/A'}")
-    print(f"  Keras Backend: {keras_backend}")
+    print(f"  Primary Keras Backend: {keras_backend}")
+
+    if len(all_backends) > 1:
+        print(f"\n  Available backends:")
+        for i, (backend_name, install_type) in enumerate(all_backends):
+            marker = " (active)" if i == 0 else ""
+            print(f"    - {backend_name} ({install_type}){marker}")
+        print(f"\n  Switch backends by editing: model_core/keras_backend.py")
     print(f"\nTo activate:")
     if platform.system() == 'Windows':
         print(f"  {venv}\\Scripts\\activate")
