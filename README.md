@@ -118,13 +118,15 @@ model-setup (this project)
     ├── Detects hardware (hardware_detector.py)
     ├── Installs dependencies (venv_builder.py)
     ├── Creates venv with Keras + backend(s)
-    └── Writes .hardware_config.json
+    └── Writes .hardware_config.json (reference for quick lookup)
            ↓
     model-core (runtime)
-        ├── Reads .hardware_config.json
-        ├── Imports keras from keras_backend.py
+        ├── Imports keras from keras_backend.py (backend selection)
+        ├── Auto-detects GPU via gpu_config.py (runtime detection)
         └── Runs training/inference
 ```
+
+**Note:** While `.hardware_config.json` is available for quick reference, model-core performs its own runtime GPU detection via `gpu_config.py` to determine optimal training parameters (batch size, LSTM units, learning rate).
 
 ## Installation Details
 
