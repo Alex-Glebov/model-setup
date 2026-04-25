@@ -18,10 +18,39 @@ Welcome to the model-setup wiki! This is the documentation hub for automated ML 
 
 Model-setup is a Python tool that automatically:
 1. Detects your GPU hardware (Jetson, CUDA, ROCm, or CPU) and version
-2. Creates a virtual environment with the correct PyTorch version
+2. Creates a virtual environment with Keras 3.x + your chosen backend(s)
 3. Installs all dependencies without requiring sudo
 4. Configures library paths for GPU acceleration
 5. Supports Linux, Windows+WSL, and multiple backends
+
+## Architecture Overview
+
+### Keras 3.x as Unified Frontend
+
+Model-setup implements **Keras 3.x with multiple execution backends**:
+
+```
+Your Model Code (uses keras API)
+         │
+         ▼
+┌─────────────────┐
+│   Keras 3.x     │  ← Unified API: layers, models, training
+│  (pip install)  │
+└────────┬────────┘
+         │
+    ┌────┴────┐
+    ▼         ▼
+┌────────┐ ┌──────────┐
+│  torch │ │tensorflow│  ← Execution backends
+│Backend │ │ Backend  │     (both can be installed)
+└────┬───┘ └────┬─────┘
+     │          │
+     └────┬─────┘
+          ▼
+   GPU Hardware
+```
+
+**Key Concept**: Write model code once using Keras API, execute on TensorFlow or PyTorch interchangeably. Switch backends by changing one environment variable.
 
 ## Quick Start
 

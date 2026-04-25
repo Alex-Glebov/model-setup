@@ -82,16 +82,47 @@ os.environ["KERAS_BACKEND"] = "torch"
 
 ## Architecture
 
+### Keras 3.x Unified Frontend
+
+Model-setup installs **Keras 3.x as the unified frontend API** with your choice of execution backend:
+
+```
+┌─────────────────────────────────────────┐
+│         Your Model Code                 │
+│    import keras  # Same API always      │
+└─────────────────────────────────────────┘
+                   │
+    ┌──────────────┼──────────────┐
+    ▼              ▼              ▼
+┌────────┐   ┌──────────┐   ┌──────────┐
+│  torch │   │tensorflow│   │   jax    │
+│Backend │   │ Backend  │   │ Backend  │
+└────────┘   └──────────┘   └──────────┘
+    │              │              │
+    └──────────────┼──────────────┘
+                   ▼
+┌─────────────────────────────────────────┐
+│        GPU Hardware (CUDA/ROCm)         │
+└─────────────────────────────────────────┘
+```
+
+**Key Concept**: Keras 3.x provides a single unified API. You write model code once using `keras`, and it executes on TensorFlow, PyTorch, or JAX without changes.
+
+- **Keras** = The API (layers, models, training loops)
+- **TensorFlow/PyTorch/JAX** = The execution engine
+
+### System Architecture
+
 ```
 model-setup (this project)
     ├── Detects hardware (hardware_detector.py)
     ├── Installs dependencies (venv_builder.py)
-    ├── Creates venv with PyTorch
+    ├── Creates venv with Keras + backend(s)
     └── Writes .hardware_config.json
            ↓
     model-core (runtime)
         ├── Reads .hardware_config.json
-        ├── Configures PyTorch/Torch device
+        ├── Imports keras from keras_backend.py
         └── Runs training/inference
 ```
 

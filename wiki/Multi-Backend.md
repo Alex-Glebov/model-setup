@@ -4,11 +4,34 @@ Model-setup supports installing multiple ML backends (PyTorch, TensorFlow) and s
 
 ## What Are Backends?
 
-In Keras 3.x, you can choose which framework executes your model:
+In Keras 3.x, **backends are the execution engines** that run your model code:
 
-- **torch**: PyTorch (default, recommended)
-- **tensorflow**: TensorFlow
-- **jax**: JAX (experimental support)
+```
+┌────────────────────────────────────────────┐
+│           Your Model (Keras API)             │
+│  model = keras.Sequential([...])             │
+│  model.fit(X, y)  # Same code for all        │
+└──────────────────┬─────────────────────────┘
+                   │
+         ┌─────────┴──────────┐
+         ▼                    ▼
+┌─────────────────┐   ┌─────────────────┐
+│   torch backend │   │tensorflow backend│
+│  (PyTorch runs  │   │ (TensorFlow runs│
+│   the model)    │   │   the model)    │
+└─────────────────┘   └─────────────────┘
+```
+
+- **Keras** = The API (layers, models, optimizers, losses)
+- **Backend** = The engine (PyTorch, TensorFlow, or JAX) that executes operations
+
+### Available Backends
+
+| Backend | Framework | Status | Best For |
+|---------|-----------|--------|----------|
+| **torch** | PyTorch | ✅ Default, recommended | Jetson, research, debugging |
+| **tensorflow** | TensorFlow | ✅ Supported | Production, TFLite, TensorBoard |
+| **jax** | JAX | ⚠️ Experimental | High-performance research |
 
 ## Installing Multiple Backends
 
