@@ -13,8 +13,8 @@ from model_setup.venv_builder import create_venv_for_hardware
 if __name__ == '__main__':
     import argparse
     import logging
-
-    logging.basicConfig(level=logging.INFO)
+    from pathlib import Path
+    from datetime import datetime
 
     parser = argparse.ArgumentParser(description='Create ML venv for detected hardware')
     parser.add_argument('venv_path', help='Path to create venv')
@@ -23,7 +23,28 @@ if __name__ == '__main__':
                         help='Action on failed install: a=auto-delete, y=ask, n=keep (default)')
     parser.add_argument('--all', action='store_true', dest='install_all',
                         help='Install ALL working backends with commented switch options')
+    parser.add_argument('--log-file', help='Path to log file (default: venv_path/../test_venv_builder.log)')
     args = parser.parse_args()
+
+    # Setup logging to both console and file
+    venv_path = Path(args.venv_path)
+    log_file = args.log_file or str(venv_path.parent / 'test_venv_builder.log')
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+
+    logger = logging.getLogger(__name__)
+    logger.info("=" * 60)
+    logger.info("Venv Builder Test Script Started")
+    logger.info(f"Timestamp: {datetime.now().isoformat()}")
+    logger.info(f"Log file: {log_file}")
+    logger.info("=" * 60)
 
     venv, hardware, keras_backend, all_backends = create_venv_for_hardware(
         args.venv_path, args.config, args.on_fail, args.install_all
