@@ -17,6 +17,76 @@ from .hardware_detector import HardwareDetector, HardwareInfo
 from .gpu_compatibility import test_gpu_compatibility, test_cpu_compatibility
 from .pip_version_checker import can_install_backend
 
+
+def is_wsl() -> bool:
+    """Detect if running under Windows Subsystem for Linux.
+
+    Returns:
+        True if running in WSL environment
+    """
+    # Check for WSL in /proc/version
+    try:
+        with open('/proc/version', 'r') as f:
+            version = f.read().lower()
+            if 'microsoft' in version or 'wsl' in version:
+                return True
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    # Check for WSL-specific environment variable
+    if os.environ.get('WSL_DISTRO_NAME') or os.environ.get('WSL_INTEROP'):
+        return True
+
+    # Check for Windows-specific paths
+    if Path('/mnt/c/Windows').exists():
+        return True
+
+    return False
+
+
+def check_wsl_prerequisites() -> tuple[bool, list[str]]:
+    """Check if WSL environment is properly configured for GPU.
+
+    Returns:
+        (is_ready, issues) where issues is a list of what's wrong
+    """
+    issues = []
+
+    if not is_wsl():
+        return True, []  # Not WSL, no issues
+
+    logger.info("WSL environment detected")
+
+    # Check WSL version (WSL 2 required for GPU)
+    try:
+        result = subprocess.run(['wsl.exe', '--version'],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            output = result.stdout.lower()
+            if 'wsl version: 1' in output or 'wsl 1' in output:
+                issues.append("WSL 1 detected - WSL 2 required for GPU support")
+            else:
+                logger.info("WSL 2 confirmed")
+        else:
+            # Try alternative check
+            result = subprocess.run(['uname', '-r'], capture_output=True, text=True)
+            if 'microsoft' not in result.stdout.lower():
+                issues.append("Cannot verify WSL version")
+    except FileNotFoundError:
+        issues.append("wsl.exe not found - are you in WSL?")
+    except subprocess.TimeoutExpired:
+        issues.append("WSL version check timeout")
+
+    # Check for GPU support in WSL
+    if not Path('/usr/lib/wsl/lib').exists():
+        issues.append("WSL GPU support not detected (/usr/lib/wsl/lib missing)")
+
+    # Check for DirectX
+    if not Path('/usr/lib/wsl/lib/libdxcore.so').exists():
+        issues.append("WSL DirectX support missing (libdxcore.so not found)")
+
+    return len(issues) == 0, issues
+
 logger = logging.getLogger(__name__)
 
 
@@ -149,7 +219,8 @@ class VenvBuilder:
         """Build installation priority queue based on detected hardware.
 
         Returns list of (backend_name, install_type) tuples.
-        Filters by PyPI availability - only includes backends that can be installed.
+        Filters by PyPI availability and prerequisite checks.
+        Logs detailed reasons why GPU options are skipped.
         """
         queue = []
 
@@ -158,40 +229,85 @@ class VenvBuilder:
             can_install, _ = can_install_backend('torch')
             if can_install:
                 queue.append(('torch', 'cpu'))
+            else:
+                logger.error("No CPU backend available on PyPI - cannot proceed")
             return queue
 
         gpu_type = self.hardware_info.gpu_type
 
+        # Check WSL prerequisites first
+        if is_wsl():
+            wsl_ready, wsl_issues = check_wsl_prerequisites()
+            if not wsl_ready:
+                logger.warning("WSL has issues that may prevent GPU usage:")
+                for issue in wsl_issues:
+                    logger.warning(f"  WSL Issue: {issue}")
+                logger.info("Will attempt CPU fallback if GPU fails")
+
         # Map hardware to (backend_name, install_type) tuples
         # Priority: GPU backends first
         if gpu_type == 'jetson':
-            # Jetson works best with torch backend
-            can_install, _ = can_install_backend('torch')
-            if can_install:
-                queue.append(('torch', 'jetson'))
+            # Check Jetson prerequisites
+            can_proceed, missing = self._check_gpu_prerequisites('jetson')
+            if not can_proceed:
+                logger.warning("Jetson prerequisites missing:")
+                for item in missing:
+                    logger.warning(f"  - {item}")
+                logger.info("Falling back to CPU")
+            else:
+                can_install, _ = can_install_backend('torch')
+                if can_install:
+                    queue.append(('torch', 'jetson'))
+                else:
+                    logger.warning("torch not available on PyPI for Jetson")
 
         elif gpu_type == 'cuda':
-            # CUDA works with torch - use 'cuda' install type
+            # Check CUDA prerequisites
+            can_proceed, missing = self._check_gpu_prerequisites('cuda')
+            if not can_proceed:
+                logger.warning("CUDA prerequisites missing:")
+                for item in missing:
+                    logger.warning(f"  - {item}")
+                logger.info("Will attempt install anyway, but may fail")
+
+            # CUDA works with torch
             can_install_torch, _ = can_install_backend('torch')
             if can_install_torch:
                 queue.append(('torch', 'cuda'))
+            else:
+                logger.warning("torch not available on PyPI for CUDA")
 
             # If --all, also try tensorflow
             if self.install_all:
                 can_install_tf, _ = can_install_backend('tensorflow')
                 if can_install_tf:
                     queue.append(('tensorflow', 'cuda'))
+                else:
+                    logger.warning("tensorflow not available on PyPI for CUDA")
 
         elif gpu_type == 'rocm':
-            # ROCm works best with torch
+            # Check ROCm prerequisites
+            can_proceed, missing = self._check_gpu_prerequisites('rocm')
+            if not can_proceed:
+                logger.warning("ROCm prerequisites missing:")
+                for item in missing:
+                    logger.warning(f"  - {item}")
+                logger.info("Will attempt install anyway, but may fail")
+
             can_install, _ = can_install_backend('torch')
             if can_install:
                 queue.append(('torch', 'rocm'))
+            else:
+                logger.warning("torch not available on PyPI for ROCm")
 
         # CPU fallback using torch (lightest weight)
         can_install, _ = can_install_backend('torch')
         if can_install:
+            if not queue:
+                logger.info("No GPU backends available, using CPU")
             queue.append(('torch', 'cpu'))
+        else:
+            logger.error("No CPU backend available - installation cannot proceed")
 
         return queue
 
@@ -369,17 +485,24 @@ class VenvBuilder:
             raise ValueError(f"Unknown install type: {install_type}")
 
     def _install_pytorch_jetson(self):
-        """Install PyTorch + Keras for Jetson."""
-        jetpack_version = self._get_jetpack_version()
-        logger.info(f"Detected JetPack: {jetpack_version}")
+        """Install PyTorch + Keras for Jetson.
 
-        if jetpack_version and jetpack_version.startswith('6'):
-            pytorch_wheel = (
-                "https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/"
-                "torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl"
-            )
-        else:
-            raise RuntimeError(f"Unsupported JetPack: {jetpack_version}")
+        Uses HardwareInfo for JetPack version detection.
+        """
+        # Use detected version from hardware_info
+        jetpack_version = self.hardware_info.cuda_version if self.hardware_info else None
+
+        # Try to parse from /etc/nv_tegra_release as fallback
+        if not jetpack_version:
+            jetpack_version = self._read_jetpack_version_from_file()
+
+        logger.info(f"Detected JetPack: {jetpack_version or 'unknown'}")
+
+        # Determine wheel URL based on JetPack version
+        pytorch_wheel = self._get_jetson_pytorch_wheel(jetpack_version)
+
+        if not pytorch_wheel:
+            raise RuntimeError(f"Unsupported JetPack version: {jetpack_version}")
 
         subprocess.run(
             [str(self.pip_path), 'install', pytorch_wheel],
@@ -395,10 +518,19 @@ class VenvBuilder:
         logger.info("Keras installed")
 
     def _install_pytorch_cuda(self):
-        """Install PyTorch + Keras for CUDA."""
+        """Install PyTorch + Keras for CUDA.
+
+        Uses detected CUDA version to select appropriate wheel.
+        Falls back to cu121 if version detection fails.
+        """
+        cuda_version = self.hardware_info.cuda_version if self.hardware_info else None
+        wheel_url = self._get_pytorch_wheel_url(cuda_version)
+
+        logger.info(f"Installing PyTorch for CUDA {cuda_version or 'unknown'} (using {wheel_url})")
+
         subprocess.run(
             [str(self.pip_path), 'install', 'torch', 'torchvision',
-             '--index-url', 'https://download.pytorch.org/whl/cu121'],
+             '--index-url', wheel_url],
             check=True
         )
         logger.info("PyTorch (CUDA) installed")
@@ -410,11 +542,59 @@ class VenvBuilder:
         )
         logger.info("Keras installed")
 
+    def _get_pytorch_wheel_url(self, cuda_version: Optional[str]) -> str:
+        """Get PyTorch wheel URL based on detected CUDA version.
+
+        Args:
+            cuda_version: Detected CUDA version string (e.g., "12.2")
+
+        Returns:
+            PyTorch wheel index URL
+        """
+        if not cuda_version:
+            logger.warning("CUDA version not detected, using default cu121")
+            return "https://download.pytorch.org/whl/cu121"
+
+        try:
+            parts = cuda_version.split('.')
+            major = parts[0]
+            minor = parts[1] if len(parts) > 1 else '0'
+
+            # Map to PyTorch wheel versions (last updated: April 2026)
+            # PyTorch supports: cu121, cu124, cu128, etc.
+            cuda_num = int(major) * 10 + int(minor)
+
+            if cuda_num >= 128:
+                wheel_ver = "cu128"
+            elif cuda_num >= 124:
+                wheel_ver = "cu124"
+            elif cuda_num >= 121:
+                wheel_ver = "cu121"
+            elif cuda_num >= 118:
+                wheel_ver = "cu118"
+            else:
+                wheel_ver = "cu121"  # Minimum supported
+
+            logger.info(f"Detected CUDA {cuda_version}, using PyTorch {wheel_ver}")
+            return f"https://download.pytorch.org/whl/{wheel_ver}"
+
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Could not parse CUDA version '{cuda_version}': {e}")
+            return "https://download.pytorch.org/whl/cu121"
+
     def _install_pytorch_rocm(self):
-        """Install PyTorch + Keras for ROCm."""
+        """Install PyTorch + Keras for ROCm.
+
+        Uses ROCm version if detected, otherwise uses default.
+        """
+        rocm_version = self._get_rocm_version()
+        wheel_url = self._get_rocm_wheel_url(rocm_version)
+
+        logger.info(f"Installing PyTorch for ROCm {rocm_version or 'unknown'} (using {wheel_url})")
+
         subprocess.run(
             [str(self.pip_path), 'install', 'torch', 'torchvision',
-             '--index-url', 'https://download.pytorch.org/whl/rocm5.7'],
+             '--index-url', wheel_url],
             check=True
         )
         logger.info("PyTorch (ROCm) installed")
@@ -472,6 +652,70 @@ class VenvBuilder:
         )
         logger.info("Keras installed")
 
+    def _read_jetpack_version_from_file(self) -> Optional[str]:
+        """Read JetPack version from /etc/nv_tegra_release.
+
+        Returns:
+            JetPack version string or None
+        """
+        try:
+            with open('/etc/nv_tegra_release', 'r') as f:
+                content = f.read()
+                # Parse version from line like "# R36 (release), REVISION: 5.0"
+                if 'REVISION:' in content:
+                    parts = content.split('REVISION:')
+                    if len(parts) > 1:
+                        return parts[1].split(',')[0].strip()
+                # Fallback: check for R36/R35
+                if 'R36' in content:
+                    return '6.0'
+                elif 'R35' in content:
+                    return '5.0'
+        except (FileNotFoundError, PermissionError, IOError):
+            pass
+        return None
+
+    def _get_jetson_pytorch_wheel(self, jetpack_version: Optional[str]) -> Optional[str]:
+        """Get PyTorch wheel URL for Jetson based on JetPack version.
+
+        Args:
+            jetpack_version: JetPack version string (e.g., "6.0")
+
+        Returns:
+            PyTorch wheel URL or None if unsupported
+        """
+        if not jetpack_version:
+            logger.warning("JetPack version unknown, assuming 6.0")
+            jetpack_version = "6.0"
+
+        # Map JetPack versions to wheel URLs
+        # These are NVIDIA-provided wheels for Jetson
+        wheel_map = {
+            "6.0": (
+                "https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/"
+                "torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl"
+            ),
+            "6.1": (
+                "https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/"
+                "torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl"
+            ),
+            # Add more versions as they become available
+        }
+
+        # Try exact match first
+        if jetpack_version in wheel_map:
+            return wheel_map[jetpack_version]
+
+        # Try major version match
+        major_ver = jetpack_version.split('.')[0]
+        for ver, wheel in wheel_map.items():
+            if ver.startswith(major_ver):
+                logger.info(f"Using wheel for JetPack {ver} (closest match to {jetpack_version})")
+                return wheel
+
+        logger.error(f"No PyTorch wheel available for JetPack {jetpack_version}")
+        return None
+
     def _install_remaining_deps(self):
         """Install remaining packages from requirements.txt."""
         logger.info("Installing remaining dependencies...")
@@ -512,33 +756,136 @@ class VenvBuilder:
 
         logger.info("Dependencies installed")
 
-    def _get_jetpack_version(self) -> Optional[str]:
-        """Get JetPack version from system."""
+    def _get_rocm_version(self) -> Optional[str]:
+        """Get ROCm version from system if available."""
         try:
-            with open('/etc/nv_tegra_release', 'r') as f:
-                content = f.read()
-                if 'R36' in content:
-                    return '6.0'
-                elif 'R35' in content:
-                    return '5.0'
-        except (FileNotFoundError, PermissionError, IOError):
+            result = subprocess.run(['rocm-smi', '--showversion'],
+                                    capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                # Parse version from output
+                for line in result.stdout.split('\n'):
+                    if 'ROCm' in line and 'version' in line:
+                        parts = line.split()
+                        for i, part in enumerate(parts):
+                            if 'version' in part.lower() and i + 1 < len(parts):
+                                return parts[i + 1].strip()
+        except (subprocess.SubprocessError, FileNotFoundError):
             pass
         return None
 
-    def _configure_cuda(self):
-        """Configure for CUDA."""
-        self._install_pytorch('cuda')
-        self._install_remaining_deps()
+    def _get_rocm_wheel_url(self, rocm_version: Optional[str]) -> str:
+        """Get PyTorch wheel URL for ROCm.
 
-    def _configure_rocm(self):
-        """Configure for ROCm."""
-        self._install_pytorch('rocm')
-        self._install_remaining_deps()
+        Args:
+            rocm_version: Detected ROCm version (e.g., "5.7")
 
-    def _configure_cpu(self):
-        """Configure for CPU."""
-        self._install_pytorch('cpu')
-        self._install_remaining_deps()
+        Returns:
+            PyTorch wheel index URL
+        """
+        if not rocm_version:
+            logger.warning("ROCm version not detected, using default rocm5.7")
+            return "https://download.pytorch.org/whl/rocm5.7"
+
+        try:
+            parts = rocm_version.split('.')
+            major = int(parts[0])
+            minor = int(parts[1]) if len(parts) > 1 else 0
+
+            # Map to PyTorch wheel versions
+            if major >= 6:
+                wheel_ver = "rocm6.0"
+            elif major == 5 and minor >= 7:
+                wheel_ver = "rocm5.7"
+            elif major == 5 and minor >= 6:
+                wheel_ver = "rocm5.6"
+            else:
+                wheel_ver = "rocm5.7"  # Default
+
+            logger.info(f"Detected ROCm {rocm_version}, using PyTorch {wheel_ver}")
+            return f"https://download.pytorch.org/whl/{wheel_ver}"
+
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Could not parse ROCm version '{rocm_version}': {e}")
+            return "https://download.pytorch.org/whl/rocm5.7"
+
+    def _check_gpu_prerequisites(self, gpu_type: str) -> tuple[bool, list[str]]:
+        """Check if GPU prerequisites are met and report what's missing.
+
+        Args:
+            gpu_type: 'cuda', 'rocm', 'jetson', or 'cpu'
+
+        Returns:
+            (can_proceed, missing_items) where missing_items is a list of
+            human-readable descriptions of what's missing
+        """
+        missing = []
+
+        if gpu_type == 'cuda':
+            # Check for nvidia-smi (drivers)
+            try:
+                result = subprocess.run(['nvidia-smi'], capture_output=True, timeout=5)
+                if result.returncode != 0:
+                    missing.append("NVIDIA drivers (nvidia-smi failed)")
+            except FileNotFoundError:
+                missing.append("nvidia-smi not found - NVIDIA drivers not installed")
+            except subprocess.TimeoutExpired:
+                missing.append("nvidia-smi timeout - driver issue?")
+
+            # Check for nvcc (CUDA toolkit)
+            try:
+                result = subprocess.run(['nvcc', '--version'], capture_output=True, timeout=5)
+                if result.returncode != 0:
+                    missing.append("CUDA toolkit (nvcc not working)")
+            except FileNotFoundError:
+                missing.append("CUDA toolkit not installed (nvcc not found)")
+
+            # Check for cuDNN (optional but recommended)
+            cudnn_path = Path('/usr/lib/x86_64-linux-gnu/libcudnn.so')
+            if not cudnn_path.exists():
+                # Also check other common locations
+                alt_paths = [
+                    Path('/usr/local/cuda/lib64/libcudnn.so'),
+                    Path('/usr/lib/aarch64-linux-gnu/libcudnn.so'),
+                ]
+                if not any(p.exists() for p in alt_paths):
+                    missing.append("cuDNN library (optional but recommended)")
+
+        elif gpu_type == 'rocm':
+            # Check for rocm-smi
+            try:
+                result = subprocess.run(['rocm-smi'], capture_output=True, timeout=5)
+                if result.returncode != 0:
+                    missing.append("ROCm drivers (rocm-smi failed)")
+            except FileNotFoundError:
+                missing.append("ROCm not installed (rocm-smi not found)")
+
+            # Check for hipcc
+            try:
+                result = subprocess.run(['hipcc', '--version'], capture_output=True, timeout=5)
+                if result.returncode != 0:
+                    missing.append("HIP compiler (hipcc not working)")
+            except FileNotFoundError:
+                missing.append("HIP toolkit not installed (hipcc not found)")
+
+        elif gpu_type == 'jetson':
+            # Check for JetPack
+            if not Path('/etc/nv_tegra_release').exists():
+                missing.append("JetPack not detected (/etc/nv_tegra_release missing)")
+
+            # Check for JetPack version compatibility
+            jetpack = self.hardware_info.cuda_version if self.hardware_info else None
+            if jetpack and not jetpack.startswith('6'):
+                missing.append(f"JetPack version {jetpack} (6.x required)")
+
+        # Log findings
+        if missing:
+            logger.warning(f"GPU prerequisites check for {gpu_type}:")
+            for item in missing:
+                logger.warning(f"  - Missing: {item}")
+        else:
+            logger.info(f"All {gpu_type} prerequisites satisfied")
+
+        return len(missing) == 0, missing
 
 
 def create_venv_for_hardware(

@@ -28,6 +28,7 @@ class HardwareInfo:
     compute_capability: Optional[str]  # e.g., "8.7" for Orin
     preferred_backend: str  # 'pytorch', 'tensorflow', 'cpu'
     gpu_available: bool
+    is_wsl: bool = False  # Windows Subsystem for Linux
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -45,22 +46,37 @@ class HardwareDetector:
         self.machine = platform.machine()
 
     def detect(self) -> HardwareInfo:
-        """Detect hardware configuration."""
+        """Detect hardware configuration with detailed logging."""
         logger.info(f"Detecting hardware on {self.platform} {self.machine}")
+
+        # Check for WSL
+        is_wsl_env = self._is_wsl()
+        if is_wsl_env:
+            logger.info("WSL environment detected")
 
         # Check for Jetson
         if self._is_jetson():
-            return self._detect_jetson()
+            logger.info("Jetson hardware detected")
+            return self._detect_jetson(is_wsl_env)
 
-        # Check for CUDA
-        if self._has_cuda():
-            return self._detect_cuda()
+        # Check for CUDA with detailed logging
+        has_cuda = self._has_cuda()
+        if has_cuda:
+            logger.info("CUDA-capable GPU detected")
+            return self._detect_cuda(is_wsl_env)
+        else:
+            logger.debug("No CUDA GPU detected (nvidia-smi not available or failed)")
 
-        # Check for ROCm
-        if self._has_rocm():
-            return self._detect_rocm()
+        # Check for ROCm with detailed logging
+        has_rocm = self._has_rocm()
+        if has_rocm:
+            logger.info("ROCm GPU detected")
+            return self._detect_rocm(is_wsl_env)
+        else:
+            logger.debug("No ROCm GPU detected (rocm-smi not available or failed)")
 
         # CPU only
+        logger.info("No GPU detected, using CPU-only configuration")
         return HardwareInfo(
             platform=self.platform,
             machine=self.machine,
@@ -71,8 +87,30 @@ class HardwareDetector:
             cudnn_version=None,
             compute_capability=None,
             preferred_backend='cpu',
-            gpu_available=False
+            gpu_available=False,
+            is_wsl=is_wsl_env
         )
+
+    def _is_wsl(self) -> bool:
+        """Check if running under Windows Subsystem for Linux."""
+        # Check for WSL in /proc/version
+        try:
+            with open('/proc/version', 'r') as f:
+                version = f.read().lower()
+                if 'microsoft' in version or 'wsl' in version:
+                    return True
+        except (FileNotFoundError, PermissionError):
+            pass
+
+        # Check for WSL-specific environment variables
+        if os.environ.get('WSL_DISTRO_NAME') or os.environ.get('WSL_INTEROP'):
+            return True
+
+        # Check for Windows mount points
+        if Path('/mnt/c/Windows').exists():
+            return True
+
+        return False
 
     def _is_jetson(self) -> bool:
         """Check if running on Jetson hardware."""
@@ -105,7 +143,7 @@ class HardwareDetector:
         except (subprocess.SubprocessError, FileNotFoundError):
             return False
 
-    def _detect_jetson(self) -> HardwareInfo:
+    def _detect_jetson(self, is_wsl: bool = False) -> HardwareInfo:
         """Detect Jetson-specific hardware."""
         logger.info("Jetson hardware detected")
 
@@ -137,12 +175,16 @@ class HardwareDetector:
             cudnn_version=None,  # Will detect via cudnn
             compute_capability=compute_capability,
             preferred_backend='pytorch',  # NVIDIA preference
-            gpu_available=compute_capability is not None
+            gpu_available=compute_capability is not None,
+            is_wsl=is_wsl
         )
 
-    def _detect_cuda(self) -> HardwareInfo:
+    def _detect_cuda(self, is_wsl: bool = False) -> HardwareInfo:
         """Detect CUDA GPU."""
         logger.info("CUDA GPU detected")
+
+        if is_wsl:
+            logger.info("Running in WSL - will use WSL-specific GPU support")
 
         gpu_name = "Unknown"
         gpu_memory_mb = None
@@ -195,12 +237,16 @@ class HardwareDetector:
             cudnn_version=None,
             compute_capability=None,
             preferred_backend='pytorch',
-            gpu_available=True
+            gpu_available=True,
+            is_wsl=is_wsl
         )
 
-    def _detect_rocm(self) -> HardwareInfo:
+    def _detect_rocm(self, is_wsl: bool = False) -> HardwareInfo:
         """Detect ROCm GPU."""
         logger.info("ROCm GPU detected")
+
+        if is_wsl:
+            logger.warning("ROCm in WSL may have limited support")
 
         return HardwareInfo(
             platform=self.platform,
@@ -212,7 +258,8 @@ class HardwareDetector:
             cudnn_version=None,
             compute_capability=None,
             preferred_backend='pytorch',
-            gpu_available=True
+            gpu_available=True,
+            is_wsl=is_wsl
         )
 
     def _read_jetpack_version(self) -> Optional[str]:
