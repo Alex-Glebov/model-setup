@@ -947,6 +947,9 @@ def create_venv_for_hardware(
     # Generate keras_backend.py for model-core with all available backends
     _generate_keras_backend_py(venv_path, keras_backend, successful_backends)
 
+    # Run verification
+    _verify_installation(venv)
+
     return venv, hardware_info, keras_backend, successful_backends
 
 
@@ -1017,6 +1020,67 @@ __all__ = ["keras"]
             logger.info(f"Switch backends by editing: {keras_backend_path}")
     except Exception as e:
         logger.warning(f"Could not generate keras_backend.py: {e}")
+
+
+def _verify_installation(venv_path: Path) -> bool:
+    """Verify installed backends are working.
+
+    Runs verify.py using venv Python without activating.
+    Logs results and returns overall success status.
+
+    Args:
+        venv_path: Path to virtual environment
+
+    Returns:
+        True if all backends working, False otherwise
+    """
+    verify_script = Path(__file__).parent / 'verify.py'
+    if not verify_script.exists():
+        logger.warning(f"Verification script not found: {verify_script}")
+        return True  # Don't fail installation if verify script missing
+
+    python_path = venv_path / 'bin' / 'python'
+    if not python_path.exists():
+        python_path = venv_path / 'Scripts' / 'python.exe'  # Windows
+
+    if not python_path.exists():
+        logger.warning(f"Python not found in venv: {venv_path}")
+        return True
+
+    logger.info("Running verification checks...")
+
+    try:
+        result = subprocess.run(
+            [str(python_path), str(verify_script)],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        # Log output
+        for line in result.stdout.split('\n'):
+            if line.strip():
+                logger.info(f"  {line}")
+
+        if result.stderr:
+            for line in result.stderr.split('\n'):
+                if line.strip():
+                    logger.warning(f"  {line}")
+
+        success = result.returncode == 0
+        if success:
+            logger.info("✓ Verification PASSED")
+        else:
+            logger.warning("✗ Verification FAILED")
+
+        return success
+
+    except subprocess.TimeoutExpired:
+        logger.warning("Verification timed out after 60 seconds")
+        return False
+    except Exception as e:
+        logger.warning(f"Verification failed: {e}")
+        return False
 
 
 if __name__ == '__main__':
