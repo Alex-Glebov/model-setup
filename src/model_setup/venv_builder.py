@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from .hardware_detector import HardwareDetector, HardwareInfo
-from .gpu_compatibility import test_gpu_compatibility, test_cpu_compatibility
+from .gpu_compatibility import test_gpu_compatibility, test_cpu_compatibility, test_tensorflow_compatibility
 from .pip_version_checker import can_install_backend
 
 
@@ -174,8 +174,8 @@ class VenvBuilder:
                 continue
 
             # TEST: Verify GPU actually works
-            logger.info(f"Testing {install_type}...")
-            success, msg = self._test_installation(install_type)
+            logger.info(f"Testing {backend_name} ({install_type})...")
+            success, msg = self._test_installation(install_type, backend_name)
 
             if success:
                 logger.info(f"✓ {backend_name} ({install_type}) PASSED: {msg}")
@@ -479,9 +479,19 @@ class VenvBuilder:
         except Exception as e:
             logger.warning(f"Failed to uninstall {backend_name}: {e}")
 
-    def _test_installation(self, install_type: str) -> tuple[bool, str]:
-        """Test if installed PyTorch variant works."""
-        if install_type == 'cpu':
+    def _test_installation(self, install_type: str, backend_name: str = 'torch') -> tuple[bool, str]:
+        """Test if installed ML backend is functional.
+
+        Args:
+            install_type: 'cuda', 'rocm', 'cpu', 'jetson'
+            backend_name: 'torch' or 'tensorflow'
+
+        Returns:
+            (success, message) tuple
+        """
+        if backend_name == 'tensorflow':
+            return test_tensorflow_compatibility(self.venv_path)
+        elif install_type == 'cpu':
             return test_cpu_compatibility(self.venv_path)
         else:
             return test_gpu_compatibility(self.venv_path)

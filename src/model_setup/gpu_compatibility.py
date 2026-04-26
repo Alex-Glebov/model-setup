@@ -193,6 +193,58 @@ except Exception as e:
         return False, f"CPU test error: {e}"
 
 
+def test_tensorflow_compatibility(venv_path: Path, timeout: int = 30) -> tuple[bool, str]:
+    """Test if TensorFlow is functional.
+
+    Args:
+        venv_path: Path to venv with TensorFlow installed
+        timeout: Maximum seconds to wait for test
+
+    Returns:
+        (success, message) tuple
+    """
+    python_path = _get_python_path(venv_path)
+
+    test_script = '''
+import tensorflow as tf
+import sys
+
+try:
+    # Test TensorFlow import and basic operation
+    x = tf.constant([[1.0, 2.0], [3.0, 4.0]])
+    y = tf.matmul(x, x)
+    result = tf.reduce_sum(y)
+
+    # Check GPU availability
+    gpus = tf.config.list_physical_devices('GPU')
+    has_gpu = len(gpus) > 0
+
+    print(f"TF_OK:GPU={has_gpu}")
+    sys.exit(0)
+
+except Exception as e:
+    print(f"TF_ERROR:{e}")
+    sys.exit(1)
+'''
+
+    try:
+        result = subprocess.run(
+            [str(python_path), '-c', test_script],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+
+        if result.returncode == 0 and "TF_OK" in result.stdout:
+            gpu_status = result.stdout.strip().split("=")[-1]
+            return True, f"TensorFlow OK (GPU={gpu_status})"
+        else:
+            return False, f"TensorFlow test failed: {result.stdout} {result.stderr}"
+
+    except Exception as e:
+        return False, f"TensorFlow test error: {e}"
+
+
 def quick_gpu_check() -> dict:
     """Quick check without full test - for build queue decisions.
 
