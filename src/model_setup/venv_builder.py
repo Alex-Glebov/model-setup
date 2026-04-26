@@ -693,22 +693,30 @@ class VenvBuilder:
     def _read_jetpack_version_from_file(self) -> Optional[str]:
         """Read JetPack version from /etc/nv_tegra_release.
 
+        Uses R# (Jetson Linux version) to determine JetPack version:
+        - R36 = JetPack 6.x
+        - R35 = JetPack 5.x
+
         Returns:
             JetPack version string or None
         """
         try:
             with open('/etc/nv_tegra_release', 'r') as f:
                 content = f.read()
-                # Parse version from line like "# R36 (release), REVISION: 5.0"
-                if 'REVISION:' in content:
-                    parts = content.split('REVISION:')
-                    if len(parts) > 1:
-                        return parts[1].split(',')[0].strip()
-                # Fallback: check for R36/R35
+
+                # Primary: Use R# (Jetson Linux version) for JetPack mapping
+                # R36 = JetPack 6.x, R35 = JetPack 5.x
                 if 'R36' in content:
+                    # Check if it's 6.0 or 6.1 based on revision
+                    if 'REVISION: 6.' in content:
+                        return '6.1'
                     return '6.0'
                 elif 'R35' in content:
+                    # JetPack 5.x uses R35
+                    if 'REVISION: 4.' in content:
+                        return '5.1'
                     return '5.0'
+
         except (FileNotFoundError, PermissionError, IOError):
             pass
         return None
@@ -721,7 +729,23 @@ class VenvBuilder:
 
         Returns:
             PyTorch wheel URL or None if unsupported
+
+        Note:
+            JetPack 5.x wheels require Python 3.8
+            JetPack 6.x wheels require Python 3.10
         """
+        python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+        # Check Python version compatibility
+        if jetpack_version and jetpack_version.startswith("5.") and python_version != "3.8":
+            logger.warning(f"JetPack {jetpack_version} wheels require Python 3.8, "
+                          f"but running Python {python_version}")
+            return None
+        elif jetpack_version and jetpack_version.startswith("6.") and python_version != "3.10":
+            logger.warning(f"JetPack {jetpack_version} wheels require Python 3.10, "
+                          f"but running Python {python_version}")
+            return None
+
         if not jetpack_version:
             logger.warning("JetPack version unknown, assuming 6.0")
             jetpack_version = "6.0"
@@ -729,6 +753,7 @@ class VenvBuilder:
         # Map JetPack versions to wheel URLs
         # These are NVIDIA-provided wheels for Jetson
         wheel_map = {
+            # JetPack 6.x (Python 3.10)
             "6.0": (
                 "https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/"
                 "torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl"
@@ -736,6 +761,15 @@ class VenvBuilder:
             "6.1": (
                 "https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/"
                 "torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl"
+            ),
+            # JetPack 5.x (Python 3.8)
+            "5.0": (
+                "https://developer.download.nvidia.com/compute/redist/jp/v51/pytorch/"
+                "torch-2.1.0a0+4136163.nv23.06-cp38-cp38-linux_aarch64.whl"
+            ),
+            "5.1": (
+                "https://developer.download.nvidia.com/compute/redist/jp/v51/pytorch/"
+                "torch-2.1.0a0+4136163.nv23.06-cp38-cp38-linux_aarch64.whl"
             ),
             # Add more versions as they become available
         }
