@@ -7,4 +7,4 @@ This package handles:
 4. Configuration file generation for model-core
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

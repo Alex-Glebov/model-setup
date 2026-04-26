@@ -131,6 +131,9 @@ class VenvBuilder:
     def create(self) -> tuple[Path, list[tuple[str, str]]]:
         """Create virtual environment with test-before-commit.
 
+        In --all mode, installs multiple backends into ONE venv.
+        Failed backends are uninstalled, successful ones remain.
+
         Returns:
             (venv_path, successful_backends) where successful_backends is
             list of (backend_name, install_type) tuples for all working backends
@@ -139,6 +142,7 @@ class VenvBuilder:
         logger.info("Venv Builder - Test Before Commit")
         if self.install_all:
             logger.info("Mode: Install ALL working backends (--all)")
+            logger.info("All backends will be installed into ONE venv")
         logger.info("=" * 60)
 
         # Preserve existing venv as venv.orig if it exists
@@ -146,31 +150,27 @@ class VenvBuilder:
             orig_path = self._rename_to_orig()
             logger.info(f"Renamed existing venv to {orig_path}")
 
+        # Create venv ONCE (all backends go into same venv)
+        self._create_venv(self.venv_path)
+        logger.info(f"Created venv at {self.venv_path}")
+
         # Build installation priority queue
         install_queue = self._build_install_queue()
         logger.info(f"Installation queue: {install_queue}")
 
-        # Track successful backends for --all mode
+        # Track successful backends
         self._successful_backends = []
-        primary_venv = None
 
-        # Try each variant
+        # Try each variant IN THE SAME VENV
         for backend_name, install_type in install_queue:
             logger.info(f"\nTrying {backend_name} ({install_type})...")
-
-            # Archive any existing venv from previous attempt
-            if self.venv_path.exists():
-                self._archive_venv(f"{backend_name}-{install_type}", failed=True)
-
-            # Create fresh venv with logging
-            self._create_venv(self.venv_path)
 
             # Install ML backend variant
             try:
                 self._install_pytorch(install_type, backend_name)
             except Exception as e:
                 logger.error(f"Install failed: {e}")
-                self._archive_venv(f"{backend_name}-{install_type}-install-failed")
+                logger.info(f"Skipping {backend_name} ({install_type})")
                 continue
 
             # TEST: Verify GPU actually works
@@ -180,37 +180,26 @@ class VenvBuilder:
             if success:
                 logger.info(f"✓ {backend_name} ({install_type}) PASSED: {msg}")
                 self._successful_backends.append((backend_name, install_type))
-                self._install_remaining_deps()
 
                 if not self.install_all:
-                    # Single install mode: return first success
+                    # Single install mode: install deps and return
+                    self._install_remaining_deps()
                     self._cleanup_logging()
                     return self.venv_path, self._successful_backends
-                else:
-                    # --all mode: save as primary if first success, then continue
-                    if primary_venv is None:
-                        primary_venv = self.venv_path
-                        # Rename to indicate it's the primary
-                        primary_path = self.venv_path.parent / f"{self.venv_path.name}-primary"
-                        shutil.move(str(self.venv_path), str(primary_path))
-                        primary_venv = primary_path
-                        logger.info(f"Saved primary backend to {primary_path}")
-                    else:
-                        # Archive additional successful backends
-                        alt_path = self.venv_path.parent / f"{self.venv_path.name}-{backend_name}"
-                        shutil.move(str(self.venv_path), str(alt_path))
-                        logger.info(f"Saved alternative backend to {alt_path}")
+                # --all mode: continue installing more backends
             else:
                 logger.warning(f"✗ {backend_name} ({install_type}) FAILED: {msg}")
-                archive_path = self._archive_venv(f"{backend_name}-{install_type}-failed")
-                self._handle_failure(archive_path, install_type)
+                # Uninstall failed backend from shared venv
+                self._uninstall_backend(backend_name, install_type)
+
+        # Install remaining dependencies after all backends
+        if self._successful_backends:
+            self._install_remaining_deps()
 
         self._cleanup_logging()
 
-        if primary_venv or self._successful_backends:
-            # Return primary venv (or first successful if not in --all mode)
-            venv_to_return = primary_venv if primary_venv else self.venv_path
-            return venv_to_return, self._successful_backends
+        if self._successful_backends:
+            return self.venv_path, self._successful_backends
 
         # Should never reach here (CPU always works)
         raise RuntimeError("All installation options failed including CPU")
@@ -459,6 +448,36 @@ class VenvBuilder:
         else:  # 'n' = keep (default)
             logger.info(f"Kept failed venv for inspection: {archive_path}")
             logger.info(f"Check log: {archive_path}/install.log")
+
+    def _uninstall_backend(self, backend_name: str, install_type: str):
+        """Uninstall a failed backend from the shared venv.
+
+        Args:
+            backend_name: 'torch' or 'tensorflow'
+            install_type: 'cuda', 'rocm', 'cpu', 'jetson'
+        """
+        logger.info(f"Uninstalling {backend_name} ({install_type}) from shared venv...")
+
+        try:
+            if backend_name == 'torch':
+                # Uninstall torch and related packages
+                subprocess.run(
+                    [str(self.pip_path), 'uninstall', '-y', 'torch', 'torchvision', 'torchaudio'],
+                    capture_output=True, timeout=60
+                )
+            elif backend_name == 'tensorflow':
+                # Uninstall tensorflow
+                subprocess.run(
+                    [str(self.pip_path), 'uninstall', '-y', 'tensorflow', 'tensorflow-cpu', 'tensorflow-gpu'],
+                    capture_output=True, timeout=60
+                )
+
+            logger.info(f"Uninstalled {backend_name} ({install_type})")
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Timeout uninstalling {backend_name}")
+        except Exception as e:
+            logger.warning(f"Failed to uninstall {backend_name}: {e}")
 
     def _test_installation(self, install_type: str) -> tuple[bool, str]:
         """Test if installed PyTorch variant works."""
