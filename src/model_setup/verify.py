@@ -26,8 +26,8 @@ def verify_torch():
             return True
 
     except ImportError:
-        print("✗ PyTorch: Not installed")
-        return False
+        print("○ PyTorch: Not installed")
+        return None
     except Exception as e:
         print(f"✗ PyTorch: Error - {e}")
         return False
@@ -50,8 +50,8 @@ def verify_tensorflow():
         return True
 
     except ImportError:
-        print("✗ TensorFlow: Not installed")
-        return False
+        print("○ TensorFlow: Not installed")
+        return None
     except Exception as e:
         print(f"✗ TensorFlow: Error - {e}")
         return False
@@ -80,9 +80,9 @@ def verify_keras():
 
         return True
 
-    except ImportError as e:
-        print(f"✗ Keras: Not installed ({e})")
-        return False
+    except ImportError:
+        print("○ Keras: Not installed")
+        return None
     except Exception as e:
         print(f"✗ Keras: Error - {e}")
         return False
@@ -116,17 +116,20 @@ def main():
     print("=" * 50)
 
     working = [k for k, v in results.items() if v]
-    failed = [k for k, v in results.items() if not v]
+    not_installed = [k for k, v in results.items() if v is None]
+    failed = [k for k, v in results.items() if v is False]
 
     if working:
         print(f"✓ Working: {', '.join(working)}")
+    if not_installed:
+        print(f"○ Not installed: {', '.join(not_installed)}")
     if failed:
         print(f"✗ Failed: {', '.join(failed)}")
 
     print()
 
-    # Return exit code
-    return 0 if all(results.values()) else 1
+    # Return exit code - only fail if something actually failed (not just not installed)
+    return 0 if not failed else 1
 
 
 if __name__ == "__main__":
