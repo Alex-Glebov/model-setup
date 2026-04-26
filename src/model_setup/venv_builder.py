@@ -300,6 +300,15 @@ class VenvBuilder:
             else:
                 logger.warning("torch not available on PyPI for ROCm")
 
+            # If --all, also try tensorflow
+            if self.install_all:
+                can_install_tf, _ = can_install_backend('tensorflow')
+                if can_install_tf:
+                    queue.append(('tensorflow', 'cpu'))  # TensorFlow doesn't support ROCm GPU
+                    logger.info("Adding tensorflow (CPU) for --all mode")
+                else:
+                    logger.warning("tensorflow not available on PyPI")
+
         # CPU fallback using torch (lightest weight)
         can_install, _ = can_install_backend('torch')
         if can_install:

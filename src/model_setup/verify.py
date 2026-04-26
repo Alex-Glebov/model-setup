@@ -60,6 +60,10 @@ def verify_tensorflow():
 def verify_keras():
     """Verify Keras installation and backend."""
     try:
+        # Set default backend if not set (required for Keras 3.x)
+        if not os.environ.get('KERAS_BACKEND'):
+            os.environ['KERAS_BACKEND'] = 'torch'
+
         import keras
 
         # Try to get backend info
@@ -76,8 +80,8 @@ def verify_keras():
 
         return True
 
-    except ImportError:
-        print("✗ Keras: Not installed")
+    except ImportError as e:
+        print(f"✗ Keras: Not installed ({e})")
         return False
     except Exception as e:
         print(f"✗ Keras: Error - {e}")
