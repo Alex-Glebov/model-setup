@@ -16,7 +16,7 @@ from typing import Optional
 from .hardware_detector import HardwareDetector, HardwareInfo
 from .gpu_compatibility import test_gpu_compatibility, test_cpu_compatibility, test_tensorflow_compatibility
 from .pip_version_checker import can_install_backend
-from . import UNINSTALL_TIMEOUT
+from . import UNINSTALL_TIMEOUT, VERIFY_TIMEOUT
 
 
 def is_wsl() -> bool:
@@ -1231,7 +1231,7 @@ def _verify_installation(venv_path: Path) -> bool:
             [str(python_path), str(verify_script)],
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=VERIFY_TIMEOUT
         )
 
         # Log output
@@ -1253,7 +1253,7 @@ def _verify_installation(venv_path: Path) -> bool:
         return success
 
     except subprocess.TimeoutExpired:
-        logger.warning("Verification timed out after 60 seconds")
+        logger.warning(f"Verification timed out after {VERIFY_TIMEOUT} seconds")
         return False
     except Exception as e:
         logger.warning(f"Verification failed: {e}")

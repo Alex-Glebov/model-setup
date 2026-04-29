@@ -13,7 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from model_setup import TF_TEST_TIMEOUT
+from model_setup import TF_TEST_TIMEOUT, GPU_TEST_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ def _get_python_path(venv_path: Path) -> Path:
     return venv_path / 'bin' / 'python'
 
 
-def test_gpu_compatibility(venv_path: Path, timeout: int = 60) -> tuple[bool, str]:
+def test_gpu_compatibility(venv_path: Path, timeout: int = GPU_TEST_TIMEOUT) -> tuple[bool, str]:
     """Test if PyTorch GPU is actually functional.
 
     Runs in the target venv to test the installed PyTorch.

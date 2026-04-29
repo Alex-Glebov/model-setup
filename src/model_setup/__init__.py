@@ -11,4 +11,6 @@ __version__ = "0.2.2"
 
 # Default timeouts (seconds)
 TF_TEST_TIMEOUT = 120      # TensorFlow first import probes GPUs, compiles kernels
-UNINSTALL_TIMEOUT = 120  # Backend uninstall can be slow due to many packages
+GPU_TEST_TIMEOUT = 120     # PyTorch GPU test (LSTM, attention ops can be slow)
+VERIFY_TIMEOUT = 120       # Post-install verification (verify.py runs all backends)
+UNINSTALL_TIMEOUT = 120    # Backend uninstall can be slow due to many packages
