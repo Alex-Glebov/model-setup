@@ -16,6 +16,7 @@ from typing import Optional
 from .hardware_detector import HardwareDetector, HardwareInfo
 from .gpu_compatibility import test_gpu_compatibility, test_cpu_compatibility, test_tensorflow_compatibility
 from .pip_version_checker import can_install_backend
+from . import UNINSTALL_TIMEOUT
 
 
 def is_wsl() -> bool:
@@ -494,13 +495,13 @@ class VenvBuilder:
                 # Uninstall torch and related packages
                 subprocess.run(
                     [str(self.pip_path), 'uninstall', '-y', 'torch', 'torchvision', 'torchaudio'],
-                    capture_output=True, timeout=120
+                    capture_output=True, timeout=UNINSTALL_TIMEOUT
                 )
             elif backend_name == 'tensorflow':
                 # Uninstall tensorflow
                 subprocess.run(
                     [str(self.pip_path), 'uninstall', '-y', 'tensorflow', 'tensorflow-cpu', 'tensorflow-gpu'],
-                    capture_output=True, timeout=120
+                    capture_output=True, timeout=UNINSTALL_TIMEOUT
                 )
 
             logger.info(f"Uninstalled {backend_name} ({install_type})")

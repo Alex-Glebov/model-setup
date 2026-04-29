@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from model_setup import TF_TEST_TIMEOUT
+
 logger = logging.getLogger(__name__)
 
 
@@ -193,7 +195,7 @@ except Exception as e:
         return False, f"CPU test error: {e}"
 
 
-def test_tensorflow_compatibility(venv_path: Path, timeout: int = 120) -> tuple[bool, str]:
+def test_tensorflow_compatibility(venv_path: Path, timeout: int = TF_TEST_TIMEOUT) -> tuple[bool, str]:
     """Test if TensorFlow is functional.
 
     Args:

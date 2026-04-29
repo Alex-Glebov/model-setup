@@ -8,3 +8,7 @@ This package handles:
 """
 
 __version__ = "0.2.2"
+
+# Default timeouts (seconds)
+TF_TEST_TIMEOUT = 120      # TensorFlow first import probes GPUs, compiles kernels
+UNINSTALL_TIMEOUT = 120  # Backend uninstall can be slow due to many packages
