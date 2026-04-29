@@ -494,13 +494,13 @@ class VenvBuilder:
                 # Uninstall torch and related packages
                 subprocess.run(
                     [str(self.pip_path), 'uninstall', '-y', 'torch', 'torchvision', 'torchaudio'],
-                    capture_output=True, timeout=60
+                    capture_output=True, timeout=120
                 )
             elif backend_name == 'tensorflow':
                 # Uninstall tensorflow
                 subprocess.run(
                     [str(self.pip_path), 'uninstall', '-y', 'tensorflow', 'tensorflow-cpu', 'tensorflow-gpu'],
-                    capture_output=True, timeout=60
+                    capture_output=True, timeout=120
                 )
 
             logger.info(f"Uninstalled {backend_name} ({install_type})")

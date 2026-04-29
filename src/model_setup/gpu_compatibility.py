@@ -193,7 +193,7 @@ except Exception as e:
         return False, f"CPU test error: {e}"
 
 
-def test_tensorflow_compatibility(venv_path: Path, timeout: int = 30) -> tuple[bool, str]:
+def test_tensorflow_compatibility(venv_path: Path, timeout: int = 120) -> tuple[bool, str]:
     """Test if TensorFlow is functional.
 
     Args:
