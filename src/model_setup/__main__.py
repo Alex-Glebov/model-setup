@@ -25,8 +25,10 @@ def main():
     venv_path = Path(args.venv_path)
     log_file = args.log_file or str(venv_path.parent / 'test_venv_builder.log')
 
-    # Ensure log directory exists
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+    # If log directory does not exist, fall back to script's directory
+    # (do not auto-create destination folders)
+    if not Path(log_file).parent.exists():
+        log_file = str(Path(__file__).resolve().parent / Path(log_file).name)
 
     logging.basicConfig(
         level=logging.INFO,
