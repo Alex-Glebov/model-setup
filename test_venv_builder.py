@@ -44,6 +44,21 @@ if __name__ == '__main__':
     logger.info("Venv Builder Test Script Started")
     logger.info(f"Timestamp: {datetime.now().isoformat()}")
     logger.info(f"Log file: {log_file}")
+    try:
+        from model_setup import __version__
+        logger.info(f"Version: {__version__}")
+    except Exception:
+        pass
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            logger.info(f"Branch: {result.stdout.strip()}")
+    except Exception:
+        pass
     logger.info("=" * 60)
 
     venv, hardware, keras_backend, all_backends = create_venv_for_hardware(

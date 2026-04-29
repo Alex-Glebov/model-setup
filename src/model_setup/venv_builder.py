@@ -140,6 +140,24 @@ class VenvBuilder:
         """
         logger.info("=" * 60)
         logger.info("Venv Builder - Test Before Commit")
+
+        # Report version and git branch
+        try:
+            import model_setup
+            logger.info(f"Version: {model_setup.__version__}")
+        except Exception:
+            logger.info("Version: unknown")
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                capture_output=True, text=True, timeout=5, cwd=str(Path(__file__).resolve().parent.parent.parent)
+            )
+            if result.returncode == 0:
+                branch = result.stdout.strip()
+                logger.info(f"Branch: {branch}")
+        except Exception:
+            pass
+
         if self.install_all:
             logger.info("Mode: Install ALL working backends (--all)")
             logger.info("All backends will be installed into ONE venv")
@@ -195,6 +213,10 @@ class VenvBuilder:
         # Install remaining dependencies after all backends
         if self._successful_backends:
             self._install_remaining_deps()
+
+        # Resolve nvidia package conflicts when multiple CUDA backends are installed
+        if self.install_all and len(self._successful_backends) > 1:
+            self._resolve_nvidia_conflicts()
 
         self._cleanup_logging()
 
@@ -259,20 +281,29 @@ class VenvBuilder:
                     logger.warning(f"  - {item}")
                 logger.info("Will attempt install anyway, but may fail")
 
-            # CUDA works with torch
+            # Build backend list for CUDA
+            cuda_backends = []
             can_install_torch, _ = can_install_backend('torch')
             if can_install_torch:
-                queue.append(('torch', 'cuda'))
+                cuda_backends.append(('torch', 'cuda'))
             else:
                 logger.warning("torch not available on PyPI for CUDA")
 
-            # If --all, also try tensorflow
             if self.install_all:
                 can_install_tf, _ = can_install_backend('tensorflow')
                 if can_install_tf:
-                    queue.append(('tensorflow', 'cuda'))
+                    cuda_backends.append(('tensorflow', 'cuda'))
                 else:
                     logger.warning("tensorflow not available on PyPI for CUDA")
+
+            # For --all: install TensorFlow FIRST so its nvidia packages take
+            # precedence, then PyTorch with --force-reinstall resolves conflicts
+            # without downgrading. Single install keeps torch first.
+            if self.install_all and len(cuda_backends) > 1:
+                cuda_backends.reverse()
+                logger.info("--all mode: installing TensorFlow before PyTorch to minimize nvidia package conflicts")
+
+            queue.extend(cuda_backends)
 
         elif gpu_type == 'rocm':
             # Check ROCm prerequisites
@@ -599,12 +630,12 @@ class VenvBuilder:
             minor = parts[1] if len(parts) > 1 else '0'
 
             # Map to PyTorch wheel versions (last updated: April 2026)
-            # PyTorch supports: cu121, cu124, cu128, etc.
+            # PyTorch supports: cu118, cu121, cu124, cu126, cu128, etc.
+            # Capped at cu124 for torch 2.5.1 compatibility.
+            # Newer CUDA drivers (12.8+) are forward-compatible with cu124 wheels.
             cuda_num = int(major) * 10 + int(minor)
 
-            if cuda_num >= 128:
-                wheel_ver = "cu128"
-            elif cuda_num >= 124:
+            if cuda_num >= 124:
                 wheel_ver = "cu124"
             elif cuda_num >= 121:
                 wheel_ver = "cu121"
@@ -689,6 +720,79 @@ class VenvBuilder:
             check=True
         )
         logger.info("Keras installed")
+
+    def _resolve_nvidia_conflicts(self):
+        """Resolve nvidia package conflicts after --all install.
+
+        When both PyTorch and TensorFlow are installed, they may bring
+        different versions of nvidia-* packages. This method reinstalls
+        PyTorch with --no-deps to keep TensorFlow's newer nvidia packages
+        (which are forward-compatible) while ensuring PyTorch's Python code
+        is correctly installed.
+
+        Logs warnings about expected pip dependency conflicts.
+        """
+        if not self.pip_path:
+            return
+
+        logger.info("Checking for nvidia package conflicts after --all install...")
+
+        # Check if torch is installed and what CUDA variant it is
+        try:
+            result = subprocess.run(
+                [str(self.pip_path), 'show', 'torch'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                logger.info("torch not installed, skipping conflict resolution")
+                return
+
+            torch_version = None
+            for line in result.stdout.split('\n'):
+                if line.startswith('Version:'):
+                    torch_version = line.split(':', 1)[1].strip()
+                    break
+
+            if not torch_version:
+                return
+
+            logger.info(f"torch version: {torch_version}")
+
+            # Check for nvidia package conflicts via pip check
+            check_result = subprocess.run(
+                [str(self.pip_path), 'check'],
+                capture_output=True, text=True, timeout=30
+            )
+
+            if check_result.returncode == 0 and not check_result.stdout:
+                logger.info("No pip dependency conflicts found")
+                return
+
+            # Log conflicts but don't fail - CUDA is forward-compatible
+            if check_result.stdout:
+                for line in check_result.stdout.strip().split('\n'):
+                    if 'nvidia-' in line:
+                        logger.warning(f"Expected conflict: {line}")
+                        logger.warning("  -> CUDA forward compatibility: this is usually harmless")
+                    else:
+                        logger.warning(f"pip check: {line}")
+
+            # Determine correct wheel URL for reinstall
+            cuda_version = self.hardware_info.cuda_version if self.hardware_info else None
+            wheel_url = self._get_pytorch_wheel_url(cuda_version)
+
+            logger.info(f"Reinstalling torch with --no-deps from {wheel_url} to resolve core installation...")
+            subprocess.run(
+                [str(self.pip_path), 'install', '--force-reinstall', '--no-deps',
+                 'torch', 'torchvision', '--index-url', wheel_url],
+                check=False, timeout=300
+            )
+            logger.info("torch reinstalled without changing nvidia packages")
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout checking/resolving nvidia conflicts")
+        except Exception as e:
+            logger.warning(f"Could not resolve nvidia conflicts: {e}")
 
     def _read_jetpack_version_from_file(self) -> Optional[str]:
         """Read JetPack version from /etc/nv_tegra_release.
