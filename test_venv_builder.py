@@ -41,14 +41,22 @@ def _ensure_model_setup():
         pass
 
     script_dir = Path(__file__).resolve().parent
+    has_local_package = (
+        (script_dir / 'pyproject.toml').exists() or
+        (script_dir / 'setup.py').exists()
+    )
 
     if _is_in_venv():
         # We're already in a venv — just install the package here
         pip = Path(sys.executable).parent / 'pip'
         if not pip.exists():
             pip = Path(sys.executable).parent / 'pip3'
-        print("model_setup not found. Installing into current venv...")
-        subprocess.run([str(pip), 'install', '--no-deps', '-e', str(script_dir)], check=True)
+        if has_local_package:
+            print("model_setup not found. Installing from local source into current venv...")
+            subprocess.run([str(pip), 'install', '--no-deps', '-e', str(script_dir)], check=True)
+        else:
+            print("model_setup not found. Installing from PyPI into current venv...")
+            subprocess.run([str(pip), 'install', 'model-setup'], check=True)
         return  # Will import successfully on next try
 
     # Not in a venv — create one next to this script
@@ -64,9 +72,13 @@ def _ensure_model_setup():
         pip = venv_path / 'bin' / 'pip'
         python = venv_path / 'bin' / 'python'
 
-    # Install model_setup from local root (pyproject.toml lives there)
-    print(f"Installing model_setup into venv...")
-    subprocess.run([str(pip), 'install', '--no-deps', '-e', str(script_dir)], check=True)
+    # Install model_setup: local if available, otherwise PyPI
+    if has_local_package:
+        print(f"Installing model_setup from local source into venv...")
+        subprocess.run([str(pip), 'install', '--no-deps', '-e', str(script_dir)], check=True)
+    else:
+        print(f"Installing model_setup from PyPI into venv...")
+        subprocess.run([str(pip), 'install', 'model-setup'], check=True)
 
     # Re-exec with venv Python, passing all original args
     print(f"Restarting with venv Python: {python}")
