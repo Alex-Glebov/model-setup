@@ -25,6 +25,9 @@ def main():
     venv_path = Path(args.venv_path)
     log_file = args.log_file or str(venv_path.parent / 'test_venv_builder.log')
 
+    # Ensure log directory exists
+    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
