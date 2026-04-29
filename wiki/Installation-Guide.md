@@ -21,13 +21,13 @@ cd model-setup
 ### Basic Usage
 
 ```bash
-python test_venv_builder.py /path/to/venv --config /path/to/config.json
+python model-setup /path/to/venv --config /path/to/config.json
 ```
 
 ### Example: Jetson Orin
 
 ```bash
-python test_venv_builder.py ~/model-core/venv \
+python model-setup ~/model-core/venv \
     --config ~/model-core/hardware_config.json \
     --log-file ~/jetson-setup.log
 ```
@@ -42,7 +42,7 @@ This will:
 ### Example: NVIDIA CUDA
 
 ```bash
-python test_venv_builder.py ~/myproject/venv \
+python model-setup ~/myproject/venv \
     --config ~/myproject/hardware_config.json \
     --log-file ~/cuda-setup.log
 ```
@@ -55,7 +55,7 @@ This will:
 ### Example: CPU Only
 
 ```bash
-python test_venv_builder.py ~/myproject/venv \
+python model-setup ~/myproject/venv \
     --config ~/myproject/hardware_config.json
 ```
 
@@ -67,7 +67,7 @@ This will:
 ### Example: Install All Backends
 
 ```bash
-python test_venv_builder.py ~/myproject/venv \
+python model-setup ~/myproject/venv \
     --config ~/myproject/hardware_config.json \
     --all
 ```
@@ -145,7 +145,7 @@ pip install -r requirements.txt
 4. **Run model-setup:**
    ```bash
    cd model-setup
-   python test_venv_builder.py ~/venv \
+   python model-setup ~/venv \
        --config ~/hardware_config.json \
        --log-file ~/wsl-setup.log
    ```

@@ -71,7 +71,7 @@ git clone https://github.com/Alex-Glebov/model-setup.git
 cd model-setup
 
 # Run setup with logging
-python test_venv_builder.py ~/venv \
+python model-setup ~/venv \
     --config ~/hardware_config.json \
     --log-file ~/wsl-setup.log
 ```

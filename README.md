@@ -60,7 +60,7 @@ python test_venv_builder.py ~/model-core/venv --log-file ~/setup.log --config ~/
 Install multiple backends and switch between them:
 
 ```bash
-python test_venv_builder.py ~/venv --all
+model-setup ~/venv --all
 ```
 
 Generates `model_core/keras_backend.py`:
@@ -200,7 +200,7 @@ model-setup/
 │   ├── gpu_compatibility.py    # GPU compatibility testing
 │   ├── pip_version_checker.py  # PyPI availability checking
 │   └── version_requirements.py # Minimum version requirements
-├── test_venv_builder.py       # CLI entry point with file logging
+├── test_venv_builder.py       # Self-bootstrapping CLI for dev
 └── README.md                   # This file
 ```
 
@@ -264,7 +264,7 @@ WARNING -   - HIP toolkit not installed (hipcc not found)
 
 ### Log File Locations
 
-**Using test_venv_builder.py:**
+**Using model-setup:**
 - Default: `{venv_parent}/test_venv_builder.log`
 - Custom: `--log-file ~/custom.log`
 
@@ -312,7 +312,7 @@ ls -la /usr/lib/wsl/lib/
 
 ### "No module named 'torch'"
 - Venv creation failed - check hardware detection output in log file
-- Try running test_venv_builder.py again with explicit path and log
+- Try running model-setup again with explicit path and log
 - Check: `cat ~/model-core/test_venv_builder.log | grep -i error`
 
 ### NumPy version errors
@@ -348,10 +348,10 @@ python -c "from model_setup.hardware_detector import HardwareDetector; \
     h = HardwareDetector().detect(); print(h)"
 
 # Test venv creation with logging
-python test_venv_builder.py /tmp/test_venv --config /tmp/test_config.json --log-file /tmp/test.log
+model-setup /tmp/test_venv --config /tmp/test_config.json --log-file /tmp/test.log
 
 # Test with all backends
-python test_venv_builder.py /tmp/test_venv --all --config /tmp/test_config.json
+model-setup /tmp/test_venv --all --config /tmp/test_config.json
 
 # View detailed logs
 cat /tmp/test.log | grep -E "(prerequisites|Missing|detected)"

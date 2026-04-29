@@ -56,13 +56,13 @@ Your Model Code (uses keras API)
 
 ```bash
 # Basic install
-python test_venv_builder.py ~/venv --config ~/config.json
+python model-setup ~/venv --config ~/config.json
 
 # Install all working backends
-python test_venv_builder.py ~/venv --all --config ~/config.json
+python model-setup ~/venv --all --config ~/config.json
 
 # With logging
-python test_venv_builder.py ~/venv --log-file ~/setup.log --config ~/config.json
+python model-setup ~/venv --log-file ~/setup.log --config ~/config.json
 ```
 
 ## Project Status

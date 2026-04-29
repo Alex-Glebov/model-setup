@@ -17,7 +17,7 @@ Common issues and solutions for model-setup.
 
 model-setup logs detailed information about what's happening. Always check logs first:
 
-### Using test_venv_builder.py
+### Using model-setup
 
 ```bash
 # Default log location
@@ -156,7 +156,7 @@ This means:
 **Solution**:
 ```bash
 cd /path/to/model-setup
-python test_venv_builder.py ...
+python model-setup ...
 ```
 
 ## GPU Not Detected

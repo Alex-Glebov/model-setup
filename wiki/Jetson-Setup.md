@@ -35,7 +35,7 @@ git clone https://github.com/Alex-Glebov/model-setup.git
 cd model-setup
 
 # Create venv
-python test_venv_builder.py ~/model-core/venv \
+python model-setup ~/model-core/venv \
     --config ~/model-core/.hardware_config.json
 
 # Activate and verify

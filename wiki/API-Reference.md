@@ -247,7 +247,7 @@ python -m model_setup.venv_builder ~/venv --config ~/config.json
 Or using the test script:
 
 ```bash
-python test_venv_builder.py ~/venv --config ~/config.json
+python model-setup ~/venv --config ~/config.json
 ```
 
 ---

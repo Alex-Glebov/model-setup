@@ -38,7 +38,7 @@ In Keras 3.x, **backends are the execution engines** that run your model code:
 ### Using `--all` Flag
 
 ```bash
-python test_venv_builder.py ~/venv \
+python model-setup ~/venv \
     --config ~/hardware_config.json \
     --all
 ```
@@ -215,7 +215,7 @@ venv-tensorflow/ # tensorflow (alternative)
 
 **Solution**: Re-install with `--all` flag:
 ```bash
-python test_venv_builder.py ~/venv --all --config ~/config.json
+python model-setup ~/venv --all --config ~/config.json
 ```
 
 ### "ImportError: cannot import name 'torch'"
