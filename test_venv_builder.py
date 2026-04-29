@@ -1,20 +1,87 @@
 #!/usr/bin/env python3
-"""Test script to run venv builder directly."""
+"""Model-setup CLI entry point.
 
+Tries to import model_setup. If unavailable:
+  - Checks if running inside a virtual environment
+  - If not, creates one in the same directory as this script
+  - Installs model_setup from the local src/ or PyPI
+  - Re-executes with the venv's Python
+
+After import succeeds, delegates to create_venv_for_hardware().
+"""
 import platform
+import subprocess
 import sys
 import os
+import venv
+from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
-from model_setup.venv_builder import create_venv_for_hardware
+def _is_in_venv() -> bool:
+    """Check if currently running inside a virtual environment."""
+    return (
+        hasattr(sys, 'real_prefix') or
+        (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix) or
+        os.environ.get('VIRTUAL_ENV') is not None
+    )
+
+
+def _ensure_model_setup():
+    """Ensure model_setup is importable.
+
+    1. Try direct import.
+    2. If in a venv, install into it.
+    3. If not in a venv, create one next to this script and install there.
+    4. Re-exec with the venv Python so imports work.
+    """
+    try:
+        import model_setup
+        return  # Already available
+    except ImportError:
+        pass
+
+    script_dir = Path(__file__).resolve().parent
+
+    if _is_in_venv():
+        # We're already in a venv — just install the package here
+        pip = Path(sys.executable).parent / 'pip'
+        if not pip.exists():
+            pip = Path(sys.executable).parent / 'pip3'
+        print("model_setup not found. Installing into current venv...")
+        subprocess.run([str(pip), 'install', '-e', str(script_dir / 'src')], check=True)
+        return  # Will import successfully on next try
+
+    # Not in a venv — create one next to this script
+    venv_path = script_dir / '.venv'
+    print(f"model_setup not found. Creating venv at {venv_path} ...")
+    venv.create(str(venv_path), with_pip=True)
+
+    # Determine pip path
+    if platform.system() == 'Windows':
+        pip = venv_path / 'Scripts' / 'pip.exe'
+        python = venv_path / 'Scripts' / 'python.exe'
+    else:
+        pip = venv_path / 'bin' / 'pip'
+        python = venv_path / 'bin' / 'python'
+
+    # Install model_setup from local src/ (editable for dev)
+    print(f"Installing model_setup into venv...")
+    subprocess.run([str(pip), 'install', '-e', str(script_dir / 'src')], check=True)
+
+    # Re-exec with venv Python, passing all original args
+    print(f"Restarting with venv Python: {python}")
+    os.execv(str(python), [str(python), __file__] + sys.argv[1:])
+
 
 if __name__ == '__main__':
+    _ensure_model_setup()
+
     import argparse
     import logging
-    from pathlib import Path
     from datetime import datetime
+
+    from model_setup import __version__
+    from model_setup.venv_builder import create_venv_for_hardware
 
     parser = argparse.ArgumentParser(description='Create ML venv for detected hardware')
     parser.add_argument('venv_path', help='Path to create venv')
@@ -41,19 +108,15 @@ if __name__ == '__main__':
 
     logger = logging.getLogger(__name__)
     logger.info("=" * 60)
-    logger.info("Venv Builder Test Script Started")
+    logger.info("Model-Setup CLI Started")
     logger.info(f"Timestamp: {datetime.now().isoformat()}")
     logger.info(f"Log file: {log_file}")
+    logger.info(f"Version: {__version__}")
     try:
-        from model_setup import __version__
-        logger.info(f"Version: {__version__}")
-    except Exception:
-        pass
-    try:
-        import subprocess
         result = subprocess.run(
             ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5,
+            cwd=str(Path(__file__).resolve().parent)
         )
         if result.returncode == 0:
             logger.info(f"Branch: {result.stdout.strip()}")

@@ -12,3 +12,4 @@ venv.*/
 .idea/
 *.swp
 *.swo
+*.egg-info/
