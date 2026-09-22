@@ -7,7 +7,7 @@ This package handles:
 4. Configuration file generation for model-core
 """
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 # Default timeouts (seconds)
 TF_TEST_TIMEOUT = 120      # TensorFlow first import probes GPUs, compiles kernels
