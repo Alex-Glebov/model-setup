@@ -20,15 +20,18 @@ def main():
     parser.add_argument('--all', action='store_true', dest='install_all',
                         help='Install ALL working backends with commented switch options')
     parser.add_argument('--log-file', help='Path to log file (default: venv_path/../test_venv_builder.log)')
+    parser.add_argument('--probe-venv', dest='probe_venv', default=None,
+                        help='Disposable probe venv where candidates are tested '
+                             '(default: no probe - candidates probed in target venv)')
     args = parser.parse_args()
 
     venv_path = Path(args.venv_path)
     log_file = args.log_file or str(venv_path.parent / 'test_venv_builder.log')
 
-    # If log directory does not exist, fall back to script's directory
+    # If log directory does not exist, fall back to the current directory
     # (do not auto-create destination folders)
     if not Path(log_file).parent.exists():
-        log_file = str(Path(__file__).resolve().parent / Path(log_file).name)
+        log_file = str(Path.cwd() / Path(log_file).name)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -52,7 +55,8 @@ def main():
     logger.info("=" * 60)
 
     venv, hardware, keras_backend, all_backends = create_venv_for_hardware(
-        args.venv_path, args.config, args.on_fail, args.install_all
+        args.venv_path, args.config, args.on_fail, args.install_all,
+        probe_venv_path=args.probe_venv
     )
 
     print(f"\n✓ Virtual environment created at: {venv}")

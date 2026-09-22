@@ -1,20 +1,45 @@
 #!/usr/bin/env python3
-"""Model-setup CLI entry point.
+"""Model-setup bootstrap wrapper (probe-then-commit venv flow).
 
-Tries to import model_setup. If unavailable:
-  - Checks if running inside a virtual environment
-  - If not, creates one in the same directory as this script
-  - Installs model_setup from the local src/ or PyPI
-  - Re-executes with the venv's Python
+Run from a project root (e.g. model-core) with the system Python:
 
-After import succeeds, delegates to create_venv_for_hardware().
+    python3 test_venv_builder.py venv --config hardware_config.json
+
+All created paths (target venv, .venv-probe, config, log) are anchored
+to the CURRENT directory - the folder the script is invoked from -
+never to the folder where this script file happens to live.
+
+Bootstrap phase (system Python):
+  - Sweeps any stale probe venv (.venv-probe in the current directory)
+  - Creates a fresh disposable probe venv
+  - Installs model-setup into it: from a locally built wheel via
+    --model-setup-wheel, from the local source tree when this script
+    lives inside the model-setup repository, or from PyPI otherwise
+  - Re-executes itself from the probe venv
+
+Probe phase (probe venv Python):
+  - model-setup probes framework candidates INSIDE the probe venv
+  - Only the proven package set is committed into the target venv
+  - The probe venv is removed at the end of the run
+
+The target venv is never deleted: it is created if missing and updated
+in place if it already exists.
 """
+import argparse
+import logging
+import os
 import platform
+import shutil
 import subprocess
 import sys
-import os
 import venv
+from datetime import datetime
 from pathlib import Path
+
+# All created paths anchor to the current directory, not the script location
+PROBE_VENV = Path.cwd() / '.venv-probe'
+# First PyPI release implementing the probe-then-commit flow
+MINIMUM_MODEL_SETUP = 'model-setup>=0.3.0'
 
 
 def _is_in_venv() -> bool:
@@ -26,93 +51,95 @@ def _is_in_venv() -> bool:
     )
 
 
-def _ensure_model_setup():
-    """Ensure model_setup is importable.
-
-    1. Try direct import.
-    2. If in a venv, install into it.
-    3. If not in a venv, create one next to this script and install there.
-    4. Re-exec with the venv Python so imports work.
-    """
+def _running_from_probe() -> bool:
+    """True when this process already runs from the probe venv."""
     try:
-        import model_setup
-        return  # Already available
-    except ImportError:
-        pass
+        return _is_in_venv() and Path(sys.prefix).resolve() == PROBE_VENV.resolve()
+    except OSError:
+        return False
 
-    script_dir = Path(__file__).resolve().parent
-    has_local_package = (
-        (script_dir / 'pyproject.toml').exists() or
-        (script_dir / 'setup.py').exists()
-    )
 
-    if _is_in_venv():
-        # We're already in a venv — just install the package here
-        pip = Path(sys.executable).parent / 'pip'
-        if not pip.exists():
-            pip = Path(sys.executable).parent / 'pip3'
-        if has_local_package:
-            print("model_setup not found. Installing from local source into current venv...")
-            subprocess.run([str(pip), 'install', '--no-deps', '-e', str(script_dir)], check=True)
-        else:
-            print("model_setup not found. Installing from PyPI into current venv...")
-            subprocess.run([str(pip), 'install', 'model-setup'], check=True)
-        return  # Will import successfully on next try
-
-    # Not in a venv — create one next to this script
-    venv_path = script_dir / '.venv'
-    print(f"model_setup not found. Creating venv at {venv_path} ...")
-    venv.create(str(venv_path), with_pip=True)
-
-    # Determine pip path
+def _remove_probe_venv(reason: str):
+    """Best-effort removal of the probe venv."""
     if platform.system() == 'Windows':
-        pip = venv_path / 'Scripts' / 'pip.exe'
-        python = venv_path / 'Scripts' / 'python.exe'
+        # A running interpreter cannot delete its own venv on Windows
+        print(f"Note: leaving probe venv in place on Windows ({reason})")
+        return
+    if PROBE_VENV.exists():
+        shutil.rmtree(PROBE_VENV, ignore_errors=True)
+        print(f"Removed probe venv ({reason}): {PROBE_VENV}")
+
+
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description='Create ML venv for detected hardware '
+                    '(probe-then-commit; the target venv is never deleted)'
+    )
+    parser.add_argument(
+        'venv_path',
+        help='Path to target venv (created if missing, updated in place if present)'
+    )
+    parser.add_argument('--config', help='Path to write hardware config JSON')
+    parser.add_argument('--on-fail', choices=['a', 'y', 'n'], default='n',
+                        help='Legacy option, accepted for compatibility '
+                             '(probe failures never touch the target venv)')
+    parser.add_argument('--all', action='store_true', dest='install_all',
+                        help='Install ALL working backends with commented switch options')
+    parser.add_argument('--log-file',
+                        help='Path to log file (default: venv_path/../test_venv_builder.log)')
+    parser.add_argument('--model-setup-wheel', dest='model_setup_wheel', default=None,
+                        help='Pre-publish validation: install model-setup from this '
+                             'wheel instead of PyPI / local source')
+    return parser.parse_args(argv)
+
+
+def _bootstrap(args):
+    """Phase 0: fresh probe venv with model-setup, then re-exec from it."""
+    _remove_probe_venv('stale sweep')
+    print(f"Creating probe venv: {PROBE_VENV}")
+    venv.create(str(PROBE_VENV), with_pip=True)
+
+    if platform.system() == 'Windows':
+        pip = PROBE_VENV / 'Scripts' / 'pip.exe'
+        python = PROBE_VENV / 'Scripts' / 'python.exe'
     else:
-        pip = venv_path / 'bin' / 'pip'
-        python = venv_path / 'bin' / 'python'
+        pip = PROBE_VENV / 'bin' / 'pip'
+        python = PROBE_VENV / 'bin' / 'python'
 
-    # Install model_setup: local if available, otherwise PyPI
-    if has_local_package:
-        print(f"Installing model_setup from local source into venv...")
-        subprocess.run([str(pip), 'install', '--no-deps', '-e', str(script_dir)], check=True)
+    cwd = Path.cwd()
+    if args.model_setup_wheel:
+        print(f"Installing model-setup from wheel: {args.model_setup_wheel}")
+        cmd = [str(pip), 'install', str(args.model_setup_wheel)]
+    elif ((cwd / 'pyproject.toml').is_file() and
+          (cwd / 'src' / 'model_setup').is_dir()):
+        # Current directory is a model-setup repository checkout: test
+        # the local source tree instead of the PyPI release
+        print(f"Installing model-setup from local source tree: {cwd}")
+        cmd = [str(pip), 'install', str(cwd)]
     else:
-        print(f"Installing model_setup from PyPI into venv...")
-        subprocess.run([str(pip), 'install', 'model-setup'], check=True)
+        print(f"Installing model-setup from PyPI ({MINIMUM_MODEL_SETUP})")
+        cmd = [str(pip), 'install', MINIMUM_MODEL_SETUP]
+    subprocess.run(cmd, check=True)
 
-    # Re-exec with venv Python, passing all original args
-    print(f"Restarting with venv Python: {python}")
-    os.execv(str(python), [str(python), __file__] + sys.argv[1:])
+    print(f"Restarting with probe venv Python: {python}")
+    sys.stdout.flush()  # os.execv does not flush Python buffers
+    os.execv(str(python), [str(python), str(Path(__file__).resolve())] + sys.argv[1:])
 
 
-if __name__ == '__main__':
-    _ensure_model_setup()
-
-    import argparse
-    import logging
-    from datetime import datetime
-
+def _run(args):
+    """Probe phase: build the target venv via probe-then-commit."""
     from model_setup import __version__
     from model_setup.venv_builder import create_venv_for_hardware
 
-    parser = argparse.ArgumentParser(description='Create ML venv for detected hardware')
-    parser.add_argument('venv_path', help='Path to create venv')
-    parser.add_argument('--config', help='Path to write hardware config JSON')
-    parser.add_argument('--on-fail', choices=['a', 'y', 'n'], default='n',
-                        help='Action on failed install: a=auto-delete, y=ask, n=keep (default)')
-    parser.add_argument('--all', action='store_true', dest='install_all',
-                        help='Install ALL working backends with commented switch options')
-    parser.add_argument('--log-file', help='Path to log file (default: venv_path/../test_venv_builder.log)')
-    args = parser.parse_args()
-
-    # Setup logging to both console and file
     venv_path = Path(args.venv_path)
-    log_file = args.log_file or str(venv_path.parent / 'test_venv_builder.log')
+    if venv_path.resolve() == PROBE_VENV.resolve():
+        raise SystemExit('Target venv path must not be the probe venv (.venv-probe)')
 
-    # If log directory does not exist, fall back to script's directory
+    log_file = args.log_file or str(venv_path.parent / 'test_venv_builder.log')
+    # If log directory does not exist, fall back to the current directory
     # (do not auto-create destination folders)
     if not Path(log_file).parent.exists():
-        log_file = str(Path(__file__).resolve().parent / Path(log_file).name)
+        log_file = str(Path.cwd() / Path(log_file).name)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -125,15 +152,15 @@ if __name__ == '__main__':
 
     logger = logging.getLogger(__name__)
     logger.info("=" * 60)
-    logger.info("Model-Setup CLI Started")
+    logger.info("Model-Setup CLI Started (probe-then-commit)")
     logger.info(f"Timestamp: {datetime.now().isoformat()}")
     logger.info(f"Log file: {log_file}")
     logger.info(f"Version: {__version__}")
     try:
+        # Branch of the project being built (current directory)
         result = subprocess.run(
             ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-            capture_output=True, text=True, timeout=5,
-            cwd=str(Path(__file__).resolve().parent)
+            capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
             logger.info(f"Branch: {result.stdout.strip()}")
@@ -141,11 +168,12 @@ if __name__ == '__main__':
         pass
     logger.info("=" * 60)
 
-    venv, hardware, keras_backend, all_backends = create_venv_for_hardware(
-        args.venv_path, args.config, args.on_fail, args.install_all
+    target, hardware, keras_backend, all_backends = create_venv_for_hardware(
+        args.venv_path, args.config, args.on_fail, args.install_all,
+        probe_venv_path=str(PROBE_VENV)
     )
 
-    print(f"\n✓ Virtual environment created at: {venv}")
+    print(f"\n✓ Virtual environment ready at: {target}")
     print(f"  Hardware: {hardware.gpu_type or 'CPU-only'}")
     print(f"  GPU: {hardware.gpu_name or 'N/A'}")
     print(f"  Primary Keras Backend: {keras_backend}")
@@ -158,6 +186,17 @@ if __name__ == '__main__':
         print(f"\n  Switch backends by editing: model_core/keras_backend.py")
     print(f"\nTo activate:")
     if platform.system() == 'Windows':
-        print(f"  {venv}\\Scripts\\activate")
+        print(f"  {target}\\Scripts\\activate")
     else:
-        print(f"  source {venv}/bin/activate")
+        print(f"  source {target}/bin/activate")
+
+
+if __name__ == '__main__':
+    parsed_args = _parse_args(sys.argv[1:])
+    if _running_from_probe():
+        try:
+            _run(parsed_args)
+        finally:
+            _remove_probe_venv('run finished')
+    else:
+        _bootstrap(parsed_args)

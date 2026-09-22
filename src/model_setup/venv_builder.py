@@ -1,7 +1,9 @@
 """Virtual environment builder for ML training.
 
-Creates venv with hardware-specific configuration and test-before-commit.
-Archives failed attempts for debugging.
+Creates the target venv with hardware-specific configuration using
+probe-then-commit: framework candidates are probed inside a disposable
+probe venv and only the proven package set is committed into the target
+venv (which is never deleted).
 """
 
 import logging
@@ -10,6 +12,7 @@ import platform
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -94,25 +97,34 @@ logger = logging.getLogger(__name__)
 class VenvBuilder:
     """Builds virtual environment with hardware-specific configuration.
 
-    Implements test-before-commit strategy:
-    1. Install GPU variant to destination
-    2. Test immediately
-    3. If pass - keep, install remaining deps
-    4. If fail - archive with logs, try next variant
-    5. CPU is guaranteed fallback
+    Implements probe-then-commit strategy:
+    1. Probe candidates inside a disposable probe venv (never the target)
+    2. Only the proven package set is committed into the target venv
+    3. The target venv is never deleted - created if missing, updated
+       in place otherwise (pip skips already-satisfied requirements, a
+       matching working backend is not reinstalled)
+    4. CPU is guaranteed fallback
     """
 
     def __init__(
         self,
         venv_path: str,
         hardware_info: Optional[HardwareInfo] = None,
-        on_fail: str = 'n',  # 'a'=auto-delete, 'y'=ask, 'n'=keep
-        install_all: bool = False  # Install all working backends
+        on_fail: str = 'n',  # legacy option, kept for CLI compatibility
+        install_all: bool = False,  # Install all working backends
+        probe_venv_path: Optional[str] = None  # Disposable probe venv
     ):
         self.venv_path = Path(venv_path)
         self.hardware_info = hardware_info
-        self.on_fail = on_fail
+        self.on_fail = on_fail  # legacy option, kept for CLI compatibility
         self.install_all = install_all
+        # Optional disposable probe venv: candidates and project
+        # requirements are probed inside it; only the proven set is
+        # committed into self.venv_path. None = legacy single-venv mode
+        # (candidates probed directly in the target venv).
+        self.probe_venv_path = Path(probe_venv_path) if probe_venv_path else None
+        # Venv that pip/uninstall/compat-test operations currently target
+        self._active_venv = self.venv_path
         self._pip_path: Optional[Path] = None
         self._log_file: Optional[Path] = None
         self._file_handler: Optional[logging.FileHandler] = None
@@ -120,67 +132,89 @@ class VenvBuilder:
 
     @property
     def pip_path(self) -> Path:
-        """Get path to venv's pip executable."""
+        """Get path to the active venv's pip executable."""
         if self._pip_path is None:
             # Windows uses Scripts\pip.exe, Unix uses bin/pip
             if platform.system() == 'Windows':
-                self._pip_path = self.venv_path / 'Scripts' / 'pip.exe'
+                self._pip_path = self._active_venv / 'Scripts' / 'pip.exe'
             else:
-                self._pip_path = self.venv_path / 'bin' / 'pip'
+                self._pip_path = self._active_venv / 'bin' / 'pip'
         return self._pip_path
 
-    def create(self) -> tuple[Path, list[tuple[str, str]]]:
-        """Create virtual environment with test-before-commit.
+    def _use_venv(self, venv_path: Path):
+        """Point pip/uninstall/compat-test operations at a specific venv."""
+        self._active_venv = Path(venv_path)
+        self._pip_path = None  # recompute for the newly active venv
 
-        In --all mode, installs multiple backends into ONE venv.
-        Failed backends are uninstalled, successful ones remain.
+    def create(self) -> tuple[Path, list[tuple[str, str]]]:
+        """Create or update the target venv using probe-then-commit.
+
+        Probe phase (with a probe venv): candidates and project requirements
+        are installed and tested inside the disposable probe venv; failed
+        candidates never touch the target. Legacy mode (no probe venv):
+        candidates are probed directly inside the target venv (created if
+        missing). In BOTH modes the target venv is never deleted.
 
         Returns:
-            (venv_path, successful_backends) where successful_backends is
+            (venv_path, successful_backends) where successful_backends is a
             list of (backend_name, install_type) tuples for all working backends
         """
         logger.info("=" * 60)
-        logger.info("Venv Builder - Test Before Commit")
-
-        # Report version and git branch
-        try:
-            import model_setup
-            logger.info(f"Version: {model_setup.__version__}")
-        except Exception:
-            logger.info("Version: unknown")
-        try:
-            result = subprocess.run(
-                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                capture_output=True, text=True, timeout=5, cwd=str(Path(__file__).resolve().parent.parent.parent)
-            )
-            if result.returncode == 0:
-                branch = result.stdout.strip()
-                logger.info(f"Branch: {branch}")
-        except Exception:
-            pass
+        logger.info("Venv Builder - Probe Then Commit")
+        logger.info(f"Timestamp: {datetime.now().isoformat()}")
 
         if self.install_all:
             logger.info("Mode: Install ALL working backends (--all)")
             logger.info("All backends will be installed into ONE venv")
+
+        if self.probe_venv_path is not None:
+            logger.info(f"Probe venv (disposable): {self.probe_venv_path}")
+        logger.info(f"Target venv (persistent - never deleted): {self.venv_path}")
         logger.info("=" * 60)
 
-        # Preserve existing venv as venv.orig if it exists
-        if self.venv_path.exists():
-            orig_path = self._rename_to_orig()
-            logger.info(f"Renamed existing venv to {orig_path}")
+        if self.probe_venv_path is not None:
+            # ---- Phase 1: probe candidates in the disposable probe venv ----
+            self._use_venv(self.probe_venv_path)
+            if not self.probe_venv_path.exists():
+                self._create_venv(self.probe_venv_path)
+                logger.info(f"Created probe venv at {self.probe_venv_path}")
+            else:
+                logger.info(f"Reusing probe venv at {self.probe_venv_path}")
+            # Full-fidelity dry run: same requirements pass as the commit phase
+            self._install_remaining_deps()
+            self._successful_backends = self._probe_candidates()
+        else:
+            # Legacy single-venv mode: probe directly in the target venv
+            if self.venv_path.exists():
+                logger.info(f"Reusing existing venv at {self.venv_path} (never deleted; updated in place)")
+            else:
+                self._create_venv(self.venv_path)
+                logger.info(f"Created venv at {self.venv_path}")
+            self._use_venv(self.venv_path)
+            self._successful_backends = self._probe_candidates()
 
-        # Create venv ONCE (all backends go into same venv)
-        self._create_venv(self.venv_path)
-        logger.info(f"Created venv at {self.venv_path}")
+        # ---- Phase 2: commit the proven set into the target venv ----
+        self._commit_backends(self._successful_backends)
 
-        # Build installation priority queue
+        self._cleanup_logging()
+
+        if self._successful_backends:
+            return self.venv_path, self._successful_backends
+
+        # Should never reach here (CPU always works)
+        raise RuntimeError("All installation options failed including CPU")
+
+    def _probe_candidates(self) -> list[tuple[str, str]]:
+        """Try each install candidate inside the active (probe) venv.
+
+        Failed candidates are uninstalled so the next candidate starts
+        clean. In single-install mode probing stops at the first working
+        backend; in --all mode every candidate is probed.
+        """
         install_queue = self._build_install_queue()
         logger.info(f"Installation queue: {install_queue}")
 
-        # Track successful backends
-        self._successful_backends = []
-
-        # Try each variant IN THE SAME VENV
+        winners: list[tuple[str, str]] = []
         for backend_name, install_type in install_queue:
             logger.info(f"\nTrying {backend_name} ({install_type})...")
 
@@ -192,40 +226,108 @@ class VenvBuilder:
                 logger.info(f"Skipping {backend_name} ({install_type})")
                 continue
 
-            # TEST: Verify GPU actually works
+            # TEST: Verify backend actually works
             logger.info(f"Testing {backend_name} ({install_type})...")
             success, msg = self._test_installation(install_type, backend_name)
 
             if success:
                 logger.info(f"✓ {backend_name} ({install_type}) PASSED: {msg}")
-                self._successful_backends.append((backend_name, install_type))
-
+                winners.append((backend_name, install_type))
                 if not self.install_all:
-                    # Single install mode: install deps and return
-                    self._install_remaining_deps()
-                    self._cleanup_logging()
-                    return self.venv_path, self._successful_backends
-                # --all mode: continue installing more backends
+                    break
             else:
                 logger.warning(f"✗ {backend_name} ({install_type}) FAILED: {msg}")
-                # Uninstall failed backend from shared venv
+                # Uninstall the failed candidate so the probe env stays clean
                 self._uninstall_backend(backend_name, install_type)
 
-        # Install remaining dependencies after all backends
-        if self._successful_backends:
-            self._install_remaining_deps()
+        return winners
 
-        # Resolve nvidia package conflicts when multiple CUDA backends are installed
-        if self.install_all and len(self._successful_backends) > 1:
+    def _commit_backends(self, winners: list[tuple[str, str]]):
+        """Commit the proven package set into the target venv (idempotent).
+
+        The target is created if missing and updated in place otherwise.
+        Project requirements are re-installed via pip (already-satisfied
+        packages are skipped), then each winning backend is committed:
+        a matching working flavor is kept, a conflicting flavor is replaced.
+        """
+        self._use_venv(self.venv_path)
+        if self.venv_path.exists():
+            logger.info(f"Reusing existing venv at {self.venv_path} (never deleted; updated in place)")
+            self._setup_venv_logging(self.venv_path)
+        else:
+            self._create_venv(self.venv_path)
+            logger.info(f"Created venv at {self.venv_path}")
+
+        # Layer 1: project requirements (pip skips already-satisfied packages)
+        self._install_remaining_deps()
+
+        # Layer 2: proven ML framework winners
+        for backend_name, install_type in winners:
+            installed_version = self._detect_backend_version(backend_name)
+            if installed_version is not None:
+                if self._backend_matches(installed_version, backend_name, install_type):
+                    ok, msg = self._test_installation(install_type, backend_name)
+                    if ok:
+                        logger.info(f"✓ {backend_name} ({install_type}) already installed and "
+                                    f"working in target - skipping reinstall ({msg})")
+                        continue
+                    logger.warning(f"{backend_name} present in target but not working "
+                                   f"({msg}) - replacing")
+                else:
+                    logger.info(f"Replacing {backend_name} flavor in target "
+                                f"('{installed_version}') with {install_type}")
+                self._uninstall_backend(backend_name, install_type)
+
+            self._install_pytorch(install_type, backend_name)
+            ok, msg = self._test_installation(install_type, backend_name)
+            if ok:
+                logger.info(f"✓ Committed {backend_name} ({install_type}) into target: {msg}")
+            else:
+                logger.error(f"Committed {backend_name} ({install_type}) failed "
+                             f"verification in target: {msg}")
+
+        # Resolve nvidia package conflicts when multiple CUDA backends installed
+        if self.install_all and len(winners) > 1:
             self._resolve_nvidia_conflicts()
 
-        self._cleanup_logging()
+    def _detect_backend_version(self, backend_name: str) -> Optional[str]:
+        """Installed version of a backend in the target venv (None = absent)."""
+        if backend_name == 'tensorflow':
+            probe = "import tensorflow as tf; print(tf.__version__)"
+        else:
+            probe = "import torch; print(torch.__version__)"
+        if platform.system() == 'Windows':
+            python = self.venv_path / 'Scripts' / 'python.exe'
+        else:
+            python = self.venv_path / 'bin' / 'python'
+        try:
+            result = subprocess.run(
+                [str(python), '-c', probe],
+                capture_output=True, text=True, timeout=VERIFY_TIMEOUT
+            )
+            if result.returncode != 0:
+                return None
+            output = result.stdout.strip()
+            return output.splitlines()[-1] if output else None
+        except Exception as e:
+            logger.warning(f"Could not probe {backend_name} in target venv: {e}")
+            return None
 
-        if self._successful_backends:
-            return self.venv_path, self._successful_backends
+    def _backend_matches(self, installed_version: str, backend_name: str,
+                          install_type: str) -> bool:
+        """Does an installed backend match the requested install type?
 
-        # Should never reach here (CPU always works)
-        raise RuntimeError("All installation options failed including CPU")
+        TensorFlow wheels carry no local flavor tag, so any working
+        installation matches (the compatibility test decides). For torch
+        the local version tag identifies the flavor.
+        """
+        if backend_name == 'tensorflow':
+            return True
+        flavor_tags = {'cpu': '+cpu', 'rocm': '+rocm', 'cuda': '+cu', 'jetson': 'nv'}
+        tag = flavor_tags.get(install_type)
+        if tag is None:
+            return True
+        return tag in installed_version
 
     def _build_install_queue(self) -> list[tuple[str, str]]:
         """Build installation priority queue based on detected hardware.
@@ -411,76 +513,6 @@ class VenvBuilder:
         except:
             pass
 
-    def _rename_to_orig(self) -> Path:
-        """Rename existing venv to venv.orig.
-
-        Returns:
-            Path to renamed venv
-        """
-        # Close any logging first
-        self._cleanup_logging()
-
-        # Find unique orig path
-        orig_path = self.venv_path.parent / f"{self.venv_path.name}.orig"
-        counter = 1
-        while orig_path.exists():
-            orig_path = self.venv_path.parent / f"{self.venv_path.name}.orig.{counter}"
-            counter += 1
-
-        # Rename venv
-        shutil.move(str(self.venv_path), str(orig_path))
-        logger.info(f"Renamed existing venv to {orig_path}")
-
-        return orig_path
-
-    def _archive_venv(self, suffix: str, failed: bool = False) -> Path:
-        """Archive venv by renaming it.
-
-        Args:
-            suffix: Name suffix (e.g., 'cuda-failed', 'rocm')
-            failed: If True, this is a failed attempt
-
-        Returns:
-            Path to archived venv
-        """
-        # Close logging before moving
-        self._cleanup_logging()
-
-        # Find unique archive path
-        archive_path = self.venv_path.parent / f"{self.venv_path.name}.{suffix}"
-        counter = 1
-        while archive_path.exists():
-            archive_path = self.venv_path.parent / f"{self.venv_path.name}.{suffix}.{counter}"
-            counter += 1
-
-        # Move venv (includes install.log)
-        shutil.move(str(self.venv_path), str(archive_path))
-
-        status = "FAILED" if failed else "archived"
-        logger.info(f"Venv {status}: {archive_path}")
-
-        return archive_path
-
-    def _handle_failure(self, archive_path: Path, install_type: str):
-        """Handle failed installation based on --on-fail setting."""
-        if self.on_fail == 'a':
-            logger.info("Auto-deleting failed venv (--on-fail=a)")
-            shutil.rmtree(archive_path)
-
-        elif self.on_fail == 'y':
-            print(f"\nFailed {install_type} venv archived to: {archive_path}")
-            print(f"Log file: {archive_path}/install.log")
-            response = input(f"Delete {archive_path}? [y/N]: ")
-            if response.lower() == 'y':
-                shutil.rmtree(archive_path)
-                logger.info(f"Deleted {archive_path}")
-            else:
-                logger.info(f"Kept {archive_path} for inspection")
-
-        else:  # 'n' = keep (default)
-            logger.info(f"Kept failed venv for inspection: {archive_path}")
-            logger.info(f"Check log: {archive_path}/install.log")
-
     def _uninstall_backend(self, backend_name: str, install_type: str):
         """Uninstall a failed backend from the shared venv.
 
@@ -522,11 +554,11 @@ class VenvBuilder:
             (success, message) tuple
         """
         if backend_name == 'tensorflow':
-            return test_tensorflow_compatibility(self.venv_path)
+            return test_tensorflow_compatibility(self._active_venv)
         elif install_type == 'cpu':
-            return test_cpu_compatibility(self.venv_path)
+            return test_cpu_compatibility(self._active_venv)
         else:
-            return test_gpu_compatibility(self.venv_path)
+            return test_gpu_compatibility(self._active_venv)
 
     def _install_pytorch(self, install_type: str, backend_name: str = 'torch'):
         """Install ML backend variant.
@@ -897,10 +929,17 @@ class VenvBuilder:
         """Install remaining packages from requirements.txt."""
         logger.info("Installing remaining dependencies...")
 
-        req_file = Path(__file__).parent.parent.parent.parent / 'model-core' / 'requirements.txt'
+        # Locate requirements.txt by convention - no hardcoded repository layout:
+        #   1. next to the target venv (the venv is created inside the project root)
+        #   2. in the current working directory (the script is run from the project root)
+        candidates = [
+            Path(self.venv_path).resolve().parent / 'requirements.txt',
+            Path.cwd() / 'requirements.txt',
+        ]
+        req_file = next((c for c in candidates if c.is_file()), None)
 
-        if not req_file.exists():
-            logger.warning(f"Requirements not found: {req_file}")
+        if req_file is None:
+            logger.warning(f"Requirements not found. Looked in: {[str(c) for c in candidates]}")
             return
 
         # Skip packages bundled with PyTorch
@@ -1069,15 +1108,20 @@ def create_venv_for_hardware(
     venv_path: str,
     output_config_path: Optional[str] = None,
     on_fail: str = 'n',
-    install_all: bool = False
+    install_all: bool = False,
+    probe_venv_path: Optional[str] = None
 ) -> tuple[Path, HardwareInfo, str, list[tuple[str, str]]]:
-    """Create venv configured for detected hardware.
+    """Create venv configured for detected hardware (probe-then-commit).
 
     Args:
-        venv_path: Where to create venv
+        venv_path: Target venv (created if missing, updated in place if present)
         output_config_path: Where to write hardware config JSON (optional)
-        on_fail: Action on failed install - 'a'=auto-delete, 'y'=ask, 'n'=keep
+        on_fail: Legacy option, accepted for compatibility (probe failures
+            never touch the target venv)
         install_all: If True, install all working backends (not just priority)
+        probe_venv_path: Disposable probe venv (e.g. .venv-probe) where
+            candidates are tested before committing into venv_path; None
+            selects legacy single-venv mode (candidates probed in target)
 
     Returns:
         (venv_path, hardware_info, keras_backend, all_successful_backends)
@@ -1086,8 +1130,9 @@ def create_venv_for_hardware(
     detector = HardwareDetector()
     hardware_info = detector.detect()
 
-    # Create venv with test-before-commit
-    builder = VenvBuilder(venv_path, hardware_info, on_fail=on_fail, install_all=install_all)
+    # Create venv with probe-then-commit
+    builder = VenvBuilder(venv_path, hardware_info, on_fail=on_fail,
+                          install_all=install_all, probe_venv_path=probe_venv_path)
     venv, successful_backends = builder.create()
 
     # Determine primary keras_backend from successful installs or hardware_info
@@ -1268,17 +1313,23 @@ if __name__ == '__main__':
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
-    parser = argparse.ArgumentParser(description='Create ML venv for detected hardware')
-    parser.add_argument('venv_path', help='Path to create venv')
+    parser = argparse.ArgumentParser(description='Create ML venv for detected hardware '
+                                                 '(probe-then-commit; target venv is never deleted)')
+    parser.add_argument('venv_path', help='Target venv path (created if missing, updated in place if present)')
     parser.add_argument('--config', help='Path to write hardware config JSON')
     parser.add_argument('--on-fail', choices=['a', 'y', 'n'], default='n',
-                        help='Action on failed install: a=auto-delete, y=ask, n=keep (default)')
+                        help='Legacy option, accepted for compatibility '
+                             '(probe failures never touch the target venv)')
     parser.add_argument('--all', action='store_true', dest='install_all',
                         help='Install ALL working backends with commented switch options')
+    parser.add_argument('--probe-venv', dest='probe_venv', default=None,
+                        help='Disposable probe venv where candidates are tested '
+                             '(default: no probe - candidates probed in target venv)')
     args = parser.parse_args()
 
     venv, hardware, keras_backend, all_backends = create_venv_for_hardware(
-        args.venv_path, args.config, args.on_fail, args.install_all
+        args.venv_path, args.config, args.on_fail, args.install_all,
+        probe_venv_path=args.probe_venv
     )
 
     print(f"\n✓ Virtual environment created at: {venv}")

@@ -6,6 +6,8 @@ __pycache__/
 # Virtual environments
 venv/
 venv.*/
+.venv/
+.venv-probe/
 
 # IDE
 .vscode/
@@ -13,3 +15,7 @@ venv.*/
 *.swp
 *.swo
 *.egg-info/
+
+# Build artifacts
+dist/
+build/
