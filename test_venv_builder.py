@@ -36,6 +36,14 @@ import venv
 from datetime import datetime
 from pathlib import Path
 
+# Harden every child process (and the re-exec'd probe phase) against console
+# encoding crashes (Windows cp1252 cannot encode all Unicode) and silence
+# pip's self-upgrade notices. The re-exec'd interpreter picks these up at
+# startup through the inherited environment.
+os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+os.environ.setdefault('PYTHONUTF8', '1')
+os.environ.setdefault('PIP_DISABLE_PIP_VERSION_CHECK', '1')
+
 # All created paths anchor to the current directory, not the script location
 PROBE_VENV = Path.cwd() / '.venv-probe'
 # First PyPI release implementing the probe-then-commit flow
@@ -60,14 +68,26 @@ def _running_from_probe() -> bool:
 
 
 def _remove_probe_venv(reason: str):
-    """Best-effort removal of the probe venv."""
-    if platform.system() == 'Windows':
-        # A running interpreter cannot delete its own venv on Windows
-        print(f"Note: leaving probe venv in place on Windows ({reason})")
+    """Best-effort removal of the probe venv.
+
+    Only a process RUNNING from the probe venv cannot delete it on Windows
+    (its own python.exe is locked); that one case schedules a detached,
+    delayed deletion that completes a few seconds after this process exits.
+    Every other caller (e.g. the stale sweep from the system interpreter)
+    deletes the probe venv immediately on all platforms - this fixes probe
+    venvs accumulating gigabytes of stale packages between runs.
+    """
+    if not PROBE_VENV.exists():
         return
-    if PROBE_VENV.exists():
-        shutil.rmtree(PROBE_VENV, ignore_errors=True)
-        print(f"Removed probe venv ({reason}): {PROBE_VENV}")
+    if _running_from_probe() and platform.system() == 'Windows':
+        print(f"Note: probe venv still in use - scheduling delayed deletion ({reason})")
+        subprocess.Popen(
+            f'cmd /c timeout /t 3 /nobreak >nul & rmdir /s /q "{PROBE_VENV}"',
+            shell=True,
+        )
+        return
+    shutil.rmtree(PROBE_VENV, ignore_errors=True)
+    print(f"Removed probe venv ({reason}): {PROBE_VENV}")
 
 
 def _parse_args(argv):
@@ -90,6 +110,9 @@ def _parse_args(argv):
     parser.add_argument('--model-setup-wheel', dest='model_setup_wheel', default=None,
                         help='Pre-publish validation: install model-setup from this '
                              'wheel instead of PyPI / local source')
+    parser.add_argument('--requirements', dest='requirements', default=None,
+                        help='Path to requirements.txt for the target venv '
+                             '(default: auto-discover)')
     return parser.parse_args(argv)
 
 
@@ -145,7 +168,7 @@ def _run(args):
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file),
+            logging.FileHandler(log_file, encoding='utf-8'),
             logging.StreamHandler()
         ]
     )
@@ -168,12 +191,16 @@ def _run(args):
         pass
     logger.info("=" * 60)
 
-    target, hardware, keras_backend, all_backends = create_venv_for_hardware(
+    target, hardware, keras_backend, all_backends, verify_ok = create_venv_for_hardware(
         args.venv_path, args.config, args.on_fail, args.install_all,
-        probe_venv_path=str(PROBE_VENV)
+        probe_venv_path=str(PROBE_VENV), requirements_path=args.requirements
     )
 
-    print(f"\n✓ Virtual environment ready at: {target}")
+    if verify_ok:
+        print(f"\n[OK] Virtual environment ready at: {target}")
+    else:
+        print(f"\n[!!] Virtual environment ready at: {target} - verification FAILED")
+        print(f"     Check the log for details: {log_file}")
     print(f"  Hardware: {hardware.gpu_type or 'CPU-only'}")
     print(f"  GPU: {hardware.gpu_name or 'N/A'}")
     print(f"  Primary Keras Backend: {keras_backend}")
@@ -189,6 +216,9 @@ def _run(args):
         print(f"  {target}\\Scripts\\activate")
     else:
         print(f"  source {target}/bin/activate")
+
+    # Non-zero exit code when verification failed so scripts/CI can detect it
+    sys.exit(0 if verify_ok else 1)
 
 
 if __name__ == '__main__':

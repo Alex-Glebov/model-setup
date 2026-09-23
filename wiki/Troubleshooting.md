@@ -94,17 +94,9 @@ wsl --shutdown
 - **Linux**: Install from [NVIDIA drivers](https://www.nvidia.com/drivers/)
 - **WSL**: Install on Windows host (not in WSL), then restart WSL
 
-### "CUDA toolkit not installed (nvcc not found)"
-
-**Cause**: NVIDIA CUDA toolkit not installed.
-
-**Solution**: Install CUDA Toolkit: https://developer.nvidia.com/cuda-downloads
-
-### "cuDNN library (optional but recommended)"
-
-**Cause**: cuDNN not installed (optional but recommended for best performance).
-
-**Solution**: Install cuDNN: https://developer.nvidia.com/cudnn
+> **Note**: The CUDA toolkit (nvcc) and cuDNN are NOT prerequisites - the
+> PyTorch/TensorFlow wheels bundle the CUDA runtime and cuDNN. A working
+> `nvidia-smi` (driver) is all model-setup checks for.
 
 ### "ROCm not installed (rocm-smi not found)"
 
@@ -112,20 +104,13 @@ wsl --shutdown
 
 **Solution**: Install ROCm: https://www.amd.com/en/developer/rocm-hub.html
 
-### "HIP toolkit not installed (hipcc not found)"
-
-**Cause**: HIP compiler not installed (part of ROCm).
-
-**Solution**: Install ROCm which includes HIP.
-
 ### Understanding the Messages
 
-When model-setup detects missing prerequisites, it will still attempt to install but warns you:
+When model-setup detects a missing driver, it will still attempt to install but warns you:
 
 ```
 WARNING - CUDA prerequisites missing:
 WARNING -   - nvidia-smi not found - NVIDIA drivers not installed
-WARNING -   - CUDA toolkit not installed (nvcc not found)
 INFO - Will attempt install anyway, but may fail
 ```
 
@@ -221,9 +206,12 @@ LD_LIBRARY_PATH=~/model-core/venv/lib/cuda/lib \
 
 ### "A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x"
 
-**Cause**: PyTorch bundled numpy 1.x, but another package upgraded it to 2.x.
+**Cause**: An old PyTorch build (< 2.3) compiled against numpy 1.x, but another
+package upgraded numpy to 2.x.
 
-**Solution**: model-setup pins numpy<2 automatically. If manually installing:
+**Solution**: model-setup installs current PyTorch (2.3+), which supports
+numpy 2.x, so this should not occur in model-setup venvs. If you must keep an
+old PyTorch, pin numpy manually:
 ```bash
 pip install 'numpy<2'
 ```

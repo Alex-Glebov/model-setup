@@ -23,6 +23,9 @@ def main():
     parser.add_argument('--probe-venv', dest='probe_venv', default=None,
                         help='Disposable probe venv where candidates are tested '
                              '(default: no probe - candidates probed in target venv)')
+    parser.add_argument('--requirements', dest='requirements', default=None,
+                        help='Path to requirements.txt for the target venv '
+                             '(default: auto-discover)')
     args = parser.parse_args()
 
     venv_path = Path(args.venv_path)
@@ -37,7 +40,7 @@ def main():
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file),
+            logging.FileHandler(log_file, encoding='utf-8'),
             logging.StreamHandler()
         ]
     )
@@ -54,12 +57,16 @@ def main():
         pass
     logger.info("=" * 60)
 
-    venv, hardware, keras_backend, all_backends = create_venv_for_hardware(
+    venv, hardware, keras_backend, all_backends, verify_ok = create_venv_for_hardware(
         args.venv_path, args.config, args.on_fail, args.install_all,
-        probe_venv_path=args.probe_venv
+        probe_venv_path=args.probe_venv, requirements_path=args.requirements
     )
 
-    print(f"\n✓ Virtual environment created at: {venv}")
+    if verify_ok:
+        print(f"\n[OK] Virtual environment created at: {venv}")
+    else:
+        print(f"\n[!!] Virtual environment created at: {venv} - verification FAILED")
+        print(f"     Check the log for details: {log_file}")
     print(f"  Hardware: {hardware.gpu_type or 'CPU-only'}")
     print(f"  GPU: {hardware.gpu_name or 'N/A'}")
     print(f"  Primary Keras Backend: {keras_backend}")
@@ -75,6 +82,9 @@ def main():
         print(f"  {venv}\\Scripts\\activate")
     else:
         print(f"  source {venv}/bin/activate")
+
+    # Non-zero exit code when verification failed so scripts/CI can detect it
+    sys.exit(0 if verify_ok else 1)
 
 
 if __name__ == '__main__':

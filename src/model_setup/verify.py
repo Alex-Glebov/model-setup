@@ -3,17 +3,38 @@
 
 Checks that installed backends are working correctly.
 Run directly with venv Python: /path/to/venv/bin/python verify.py
+
+Output uses ASCII markers ([OK]/[FAIL]/[--]) so it is encodable on every
+console, including Windows legacy code pages (cp1252) that cannot encode
+characters like U+2713 and would otherwise crash the verification run.
 """
 
 import sys
 import os
 
 
+def _ensure_unicode_safe_output():
+    """Make stdout/stderr survive any console encoding.
+
+    ASCII markers keep this script's own output safe everywhere; this
+    reconfigure additionally protects error messages that may contain
+    arbitrary Unicode produced by imported libraries (e.g. a torch
+    import traceback), which would otherwise abort verification midway
+    and report a false failure on cp1252 consoles.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
+
+
 def verify_torch():
     """Verify PyTorch installation."""
     try:
         import torch
-        print(f"✓ PyTorch: {torch.__version__}")
+        print(f"[OK] PyTorch: {torch.__version__}")
 
         if torch.cuda.is_available():
             print(f"  CUDA available: True")
@@ -26,10 +47,10 @@ def verify_torch():
             return True
 
     except ImportError:
-        print("○ PyTorch: Not installed")
+        print("[--] PyTorch: Not installed")
         return None
     except Exception as e:
-        print(f"✗ PyTorch: Error - {e}")
+        print(f"[FAIL] PyTorch: Error - {e}")
         return False
 
 
@@ -37,7 +58,7 @@ def verify_tensorflow():
     """Verify TensorFlow installation."""
     try:
         import tensorflow as tf
-        print(f"✓ TensorFlow: {tf.__version__}")
+        print(f"[OK] TensorFlow: {tf.__version__}")
 
         gpus = tf.config.list_physical_devices('GPU')
         if gpus:
@@ -50,10 +71,10 @@ def verify_tensorflow():
         return True
 
     except ImportError:
-        print("○ TensorFlow: Not installed")
+        print("[--] TensorFlow: Not installed")
         return None
     except Exception as e:
-        print(f"✗ TensorFlow: Error - {e}")
+        print(f"[FAIL] TensorFlow: Error - {e}")
         return False
 
 
@@ -74,22 +95,24 @@ def verify_keras():
             backend_name = str(keras.backend())
 
         if backend_name:
-            print(f"✓ Keras: {keras.__version__} (backend: {backend_name})")
+            print(f"[OK] Keras: {keras.__version__} (backend: {backend_name})")
         else:
-            print(f"✓ Keras: {keras.__version__}")
+            print(f"[OK] Keras: {keras.__version__}")
 
         return True
 
     except ImportError:
-        print("○ Keras: Not installed")
+        print("[--] Keras: Not installed")
         return None
     except Exception as e:
-        print(f"✗ Keras: Error - {e}")
+        print(f"[FAIL] Keras: Error - {e}")
         return False
 
 
 def main():
     """Run verification checks."""
+    _ensure_unicode_safe_output()
+
     print("=" * 50)
     print("Model-Setup Installation Verification")
     print("=" * 50)
@@ -120,11 +143,11 @@ def main():
     failed = [k for k, v in results.items() if v is False]
 
     if working:
-        print(f"✓ Working: {', '.join(working)}")
+        print(f"[OK] Working: {', '.join(working)}")
     if not_installed:
-        print(f"○ Not installed: {', '.join(not_installed)}")
+        print(f"[--] Not installed: {', '.join(not_installed)}")
     if failed:
-        print(f"✗ Failed: {', '.join(failed)}")
+        print(f"[FAIL] Failed: {', '.join(failed)}")
 
     print()
 

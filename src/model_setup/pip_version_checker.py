@@ -148,11 +148,11 @@ if __name__ == "__main__":
 
     for backend in ["torch", "tensorflow", "jax"]:
         can_install, details = can_install_backend(backend)
-        status = "✓ CAN INSTALL" if can_install else "✗ CANNOT INSTALL"
+        status = "[OK] CAN INSTALL" if can_install else "[FAIL] CANNOT INSTALL"
         print(f"Backend: {backend} {status}")
 
         for pkg, (available, latest) in details.items():
-            symbol = "✓" if available else "✗"
+            symbol = "[OK]" if available else "[FAIL]"
             req = BACKEND_REQUIREMENTS.get(backend, [])
             min_ver = next((r.min_version for r in req if r.name == pkg), "?")
             print(f"  {symbol} {pkg}: need >={min_ver}, latest={latest or 'unknown'}")

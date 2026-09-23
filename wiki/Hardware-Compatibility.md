@@ -93,8 +93,8 @@ Complete compatibility matrix for model-setup.
 
 ### CUDA
 
-- **cuDNN**: Must match PyTorch compilation version
-- **Driver**: Must be compatible with CUDA version
+- **cuDNN**: Bundled inside the PyTorch/TensorFlow wheels - no system cuDNN needed
+- **Driver**: `nvidia-smi` must work; model-setup selects the newest wheel index your driver supports
 
 ### ROCm
 

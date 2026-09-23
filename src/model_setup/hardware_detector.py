@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import platform
+import shutil
 import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -128,7 +129,10 @@ class HardwareDetector:
                 timeout=5
             )
             return result.returncode == 0
-        except (subprocess.SubprocessError, FileNotFoundError):
+        except (subprocess.SubprocessError, OSError):
+            # OSError covers FileNotFoundError AND PermissionError (a tool
+            # on PATH that cannot be executed, e.g. a Windows nvcc.exe
+            # resolved through WSL PATH interop)
             return False
 
     def _has_rocm(self) -> bool:
@@ -140,7 +144,7 @@ class HardwareDetector:
                 timeout=5
             )
             return result.returncode == 0
-        except (subprocess.SubprocessError, FileNotFoundError):
+        except (subprocess.SubprocessError, OSError):
             return False
 
     def _detect_jetson(self, is_wsl: bool = False) -> HardwareInfo:
@@ -205,27 +209,57 @@ class HardwareDetector:
                     # Parse "8192 MiB"
                     if 'MiB' in mem_str:
                         gpu_memory_mb = int(mem_str.replace('MiB', '').strip())
-        except (subprocess.SubprocessError, FileNotFoundError, ValueError):
+        except (subprocess.SubprocessError, OSError, ValueError):
             pass
 
-        # Get CUDA version
+        # Get the CUDA version from the NVIDIA driver (nvidia-smi banner).
+        # This works on Windows, native Linux and WSL alike - the banner
+        # reports the driver's maximum supported CUDA (e.g. "CUDA Version: 13.2").
         try:
             result = subprocess.run(
-                ['nvcc', '--version'],
+                ['nvidia-smi'],
                 capture_output=True,
                 text=True,
                 timeout=5
             )
             if result.returncode == 0:
                 for line in result.stdout.split('\n'):
-                    if 'release' in line:
-                        parts = line.split()
-                        for i, part in enumerate(parts):
-                            if part == 'release':
-                                cuda_version = parts[i + 1].rstrip(',')
-                                break
-        except (subprocess.SubprocessError, FileNotFoundError):
+                    if 'CUDA Version:' in line:
+                        cuda_version = line.split('CUDA Version:')[1].strip().split()[0]
+                        logger.info(f"NVIDIA driver reports CUDA {cuda_version}")
+                        break
+        except (subprocess.SubprocessError, OSError):
             pass
+
+        # Fallback: CUDA toolkit (nvcc) when the driver banner is unavailable.
+        # Never let nvcc raise: it may be absent (normal on WSL) or resolve
+        # to a Windows binary via WSL PATH interop that Linux cannot execute
+        # (PermissionError). shutil.which() + a broad OSError catch keep
+        # detection alive in every environment.
+        if not cuda_version:
+            nvcc = shutil.which('nvcc')
+            if nvcc:
+                try:
+                    result = subprocess.run(
+                        [nvcc, '--version'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if result.returncode == 0:
+                        for line in result.stdout.split('\n'):
+                            if 'release' in line:
+                                parts = line.split()
+                                for i, part in enumerate(parts):
+                                    if part == 'release':
+                                        cuda_version = parts[i + 1].rstrip(',')
+                                        break
+                except (subprocess.SubprocessError, OSError):
+                    pass
+
+        if not cuda_version:
+            logger.debug("CUDA version not detected; "
+                         "PyTorch wheel selection falls back to a safe default")
 
         return HardwareInfo(
             platform=self.platform,

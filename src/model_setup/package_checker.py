@@ -133,7 +133,7 @@ def format_backend_status(backend: str) -> str:
     lines.append("  Requirements:")
 
     for pkg, (satisfied, version) in details.items():
-        status = "✓" if satisfied else "✗"
+        status = "[OK]" if satisfied else "[FAIL]"
         version_str = version or "not installed"
         req = BACKEND_REQUIREMENTS.get(backend, [])
         min_ver = next((r.min_version for r in req if r.name == pkg), "?")

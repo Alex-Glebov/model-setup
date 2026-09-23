@@ -76,10 +76,12 @@ def check_wsl_prerequisites() -> tuple[bool, list[str]]:
             result = subprocess.run(['uname', '-r'], capture_output=True, text=True)
             if 'microsoft' not in result.stdout.lower():
                 issues.append("Cannot verify WSL version")
-    except FileNotFoundError:
-        issues.append("wsl.exe not found - are you in WSL?")
     except subprocess.TimeoutExpired:
         issues.append("WSL version check timeout")
+    except (OSError, subprocess.SubprocessError):
+        # OSError covers FileNotFoundError AND PermissionError (e.g. Windows
+        # binaries resolved through WSL PATH interop)
+        issues.append("wsl.exe not found - are you in WSL?")
 
     # Check for GPU support in WSL
     if not Path('/usr/lib/wsl/lib').exists():
@@ -112,12 +114,16 @@ class VenvBuilder:
         hardware_info: Optional[HardwareInfo] = None,
         on_fail: str = 'n',  # legacy option, kept for CLI compatibility
         install_all: bool = False,  # Install all working backends
-        probe_venv_path: Optional[str] = None  # Disposable probe venv
+        probe_venv_path: Optional[str] = None,  # Disposable probe venv
+        requirements_path: Optional[str] = None  # Explicit requirements.txt
     ):
         self.venv_path = Path(venv_path)
         self.hardware_info = hardware_info
         self.on_fail = on_fail  # legacy option, kept for CLI compatibility
         self.install_all = install_all
+        # Explicit path to the project's requirements.txt; None = auto-discover
+        # (see _install_remaining_deps)
+        self.requirements_path = requirements_path
         # Optional disposable probe venv: candidates and project
         # requirements are probed inside it; only the proven set is
         # committed into self.venv_path. None = legacy single-venv mode
@@ -129,6 +135,14 @@ class VenvBuilder:
         self._log_file: Optional[Path] = None
         self._file_handler: Optional[logging.FileHandler] = None
         self._successful_backends: list[tuple[str, str]] = []  # (backend_name, install_type)
+        # Exact package versions validated during probing, per backend name.
+        # The commit phase re-installs these pins so the target venv ends up
+        # with the same versions that were actually verified (prevents
+        # probe/commit version drift).
+        self._probe_pins: dict[str, dict[str, str]] = {}
+        # Pins currently applied by the install methods ({} while probing,
+        # the probed pins while committing)
+        self._active_pins: dict[str, str] = {}
 
     @property
     def pip_path(self) -> Path:
@@ -159,6 +173,13 @@ class VenvBuilder:
             (venv_path, successful_backends) where successful_backends is a
             list of (backend_name, install_type) tuples for all working backends
         """
+        # Harden every child process (pip, verify.py) against console encoding
+        # crashes (Windows cp1252 cannot encode all Unicode) and silence pip's
+        # self-upgrade notices. setdefault keeps user overrides intact.
+        os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+        os.environ.setdefault('PYTHONUTF8', '1')
+        os.environ.setdefault('PIP_DISABLE_PIP_VERSION_CHECK', '1')
+
         logger.info("=" * 60)
         logger.info("Venv Builder - Probe Then Commit")
         logger.info(f"Timestamp: {datetime.now().isoformat()}")
@@ -231,16 +252,65 @@ class VenvBuilder:
             success, msg = self._test_installation(install_type, backend_name)
 
             if success:
-                logger.info(f"✓ {backend_name} ({install_type}) PASSED: {msg}")
+                logger.info(f"[OK] {backend_name} ({install_type}) PASSED: {msg}")
                 winners.append((backend_name, install_type))
+                # Record exact versions so the commit phase can reproduce them
+                self._record_probe_pins(backend_name)
                 if not self.install_all:
                     break
             else:
-                logger.warning(f"✗ {backend_name} ({install_type}) FAILED: {msg}")
+                logger.warning(f"[FAIL] {backend_name} ({install_type}) FAILED: {msg}")
                 # Uninstall the failed candidate so the probe env stays clean
                 self._uninstall_backend(backend_name, install_type)
 
         return winners
+
+    def _record_probe_pins(self, backend_name: str):
+        """Record the exact package versions that just passed probing.
+
+        The commit phase re-installs these pins so a pre-existing target
+        venv is upgraded to the versions that were actually validated
+        (prevents probe/commit version drift: without this, pip sees an
+        'already satisfied' requirement in the target and keeps the old
+        version while the probe validated a newer one).
+        """
+        packages = ('torch', 'torchvision', 'tensorflow', 'tensorflow-cpu', 'keras')
+        try:
+            result = subprocess.run(
+                [str(self.pip_path), 'freeze'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode != 0:
+                return
+            pins = {}
+            for line in result.stdout.split('\n'):
+                if '==' in line and '@' not in line:
+                    name, _, version = line.partition('==')
+                    if name.strip().lower() in packages:
+                        pins[name.strip().lower()] = version.strip()
+            if pins:
+                self._probe_pins[backend_name] = pins
+                logger.info(f"Probed versions to commit for {backend_name}: {pins}")
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.debug(f"Could not record probe pins for {backend_name}: {e}")
+
+    def _pin(self, package: str, default_spec: str) -> str:
+        """Return 'package==probed_version' if probed, else the default spec."""
+        version = self._active_pins.get(package)
+        if version:
+            return f"{package}=={version}"
+        return default_spec
+
+    def _version_matches_pins(self, backend_name: str, installed_version: str) -> bool:
+        """Does an installed backend version match what the probe validated?
+
+        When nothing was pinned (legacy single-venv mode, or pin recording
+        failed) any working installation is treated as matching.
+        """
+        pin = self._probe_pins.get(backend_name, {}).get(backend_name)
+        if pin is None:
+            return True
+        return installed_version == pin
 
     def _commit_backends(self, winners: list[tuple[str, str]]):
         """Commit the proven package set into the target venv (idempotent).
@@ -263,16 +333,24 @@ class VenvBuilder:
 
         # Layer 2: proven ML framework winners
         for backend_name, install_type in winners:
+            # Commit the exact versions that were validated in the probe
+            self._active_pins = self._probe_pins.get(backend_name, {})
             installed_version = self._detect_backend_version(backend_name)
             if installed_version is not None:
                 if self._backend_matches(installed_version, backend_name, install_type):
-                    ok, msg = self._test_installation(install_type, backend_name)
-                    if ok:
-                        logger.info(f"✓ {backend_name} ({install_type}) already installed and "
-                                    f"working in target - skipping reinstall ({msg})")
-                        continue
-                    logger.warning(f"{backend_name} present in target but not working "
-                                   f"({msg}) - replacing")
+                    if self._version_matches_pins(backend_name, installed_version):
+                        ok, msg = self._test_installation(install_type, backend_name)
+                        if ok:
+                            logger.info(f"[OK] {backend_name} ({install_type}) already installed "
+                                        f"at the probed version and working in target - "
+                                        f"skipping reinstall ({msg})")
+                            continue
+                        logger.warning(f"{backend_name} present in target but not working "
+                                       f"({msg}) - replacing")
+                    else:
+                        logger.info(f"Upgrading {backend_name} in target from "
+                                    f"'{installed_version}' to the probed version "
+                                    f"({self._active_pins.get(backend_name, 'latest')})")
                 else:
                     logger.info(f"Replacing {backend_name} flavor in target "
                                 f"('{installed_version}') with {install_type}")
@@ -281,7 +359,7 @@ class VenvBuilder:
             self._install_pytorch(install_type, backend_name)
             ok, msg = self._test_installation(install_type, backend_name)
             if ok:
-                logger.info(f"✓ Committed {backend_name} ({install_type}) into target: {msg}")
+                logger.info(f"[OK] Committed {backend_name} ({install_type}) into target: {msg}")
             else:
                 logger.error(f"Committed {backend_name} ({install_type}) failed "
                              f"verification in target: {msg}")
@@ -466,7 +544,9 @@ class VenvBuilder:
 
         # Create log file in venv
         self._log_file = venv_path / 'install.log'
-        self._file_handler = logging.FileHandler(self._log_file)
+        # UTF-8 log file: never crashes on non-ASCII (e.g. Unicode GPU names)
+        # regardless of the console's code page
+        self._file_handler = logging.FileHandler(self._log_file, encoding='utf-8')
         self._file_handler.setFormatter(logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         ))
@@ -612,9 +692,9 @@ class VenvBuilder:
         )
         logger.info("PyTorch (Jetson) installed")
 
-        # Install Keras 3.x
+        # Install Keras 3.x (pinned to the probed version when available)
         subprocess.run(
-            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            [str(self.pip_path), 'install', self._pin('keras', 'keras>=3.0.0')],
             check=True
         )
         logger.info("Keras installed")
@@ -631,58 +711,81 @@ class VenvBuilder:
         logger.info(f"Installing PyTorch for CUDA {cuda_version or 'unknown'} (using {wheel_url})")
 
         subprocess.run(
-            [str(self.pip_path), 'install', 'torch', 'torchvision',
+            [str(self.pip_path), 'install',
+             self._pin('torch', 'torch'),
+             self._pin('torchvision', 'torchvision'),
              '--index-url', wheel_url],
             check=True
         )
         logger.info("PyTorch (CUDA) installed")
 
-        # Install Keras 3.x
+        # Install Keras 3.x (pinned to the probed version when available)
         subprocess.run(
-            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            [str(self.pip_path), 'install', self._pin('keras', 'keras>=3.0.0')],
             check=True
         )
         logger.info("Keras installed")
 
+    # CUDA driver version (as major*10+minor) -> PyTorch wheel index.
+    # First matching row wins, so newer drivers get the newest index.
+    # Verified against download.pytorch.org (September 2026): cu130 serves
+    # torch 2.14.0, cu126/cu128 serve 2.9.1, cu124 serves 2.6.0.
+    CUDA_WHEEL_MAP = [
+        (130, "cu130"),
+        (128, "cu128"),
+        (126, "cu126"),
+        (124, "cu124"),
+        (121, "cu121"),
+        (118, "cu118"),
+    ]
+    # Conservative fallback when detection fails (also safe on older GPUs:
+    # cu121 wheels support sm_37+)
+    DEFAULT_CUDA_WHEEL = "cu121"
+    # Environment variable for an explicit index override, e.g.
+    # MODEL_SETUP_TORCH_INDEX=https://download.pytorch.org/whl/cu126
+    TORCH_INDEX_OVERRIDE_ENV = "MODEL_SETUP_TORCH_INDEX"
+
     def _get_pytorch_wheel_url(self, cuda_version: Optional[str]) -> str:
-        """Get PyTorch wheel URL based on detected CUDA version.
+        """Get PyTorch wheel URL based on the detected CUDA driver version.
+
+        Preference order:
+          1. MODEL_SETUP_TORCH_INDEX environment variable (explicit override)
+          2. Highest supported wheel index for the detected driver version
+          3. DEFAULT_CUDA_WHEEL when version detection fails
 
         Args:
-            cuda_version: Detected CUDA version string (e.g., "12.2")
+            cuda_version: Detected CUDA version string (e.g., "13.2")
 
         Returns:
             PyTorch wheel index URL
         """
+        override = os.environ.get(self.TORCH_INDEX_OVERRIDE_ENV)
+        if override:
+            logger.info(f"Using PyTorch index from {self.TORCH_INDEX_OVERRIDE_ENV}: {override}")
+            return override
+
         if not cuda_version:
-            logger.warning("CUDA version not detected, using default cu121")
-            return "https://download.pytorch.org/whl/cu121"
+            logger.warning(f"CUDA version not detected, using default {self.DEFAULT_CUDA_WHEEL}")
+            return f"https://download.pytorch.org/whl/{self.DEFAULT_CUDA_WHEEL}"
 
         try:
             parts = cuda_version.split('.')
-            major = parts[0]
-            minor = parts[1] if len(parts) > 1 else '0'
+            cuda_num = int(parts[0]) * 10 + int(parts[1] if len(parts) > 1 else '0')
 
-            # Map to PyTorch wheel versions (last updated: April 2026)
-            # PyTorch supports: cu118, cu121, cu124, cu126, cu128, etc.
-            # Capped at cu124 for torch 2.5.1 compatibility.
-            # Newer CUDA drivers (12.8+) are forward-compatible with cu124 wheels.
-            cuda_num = int(major) * 10 + int(minor)
-
-            if cuda_num >= 124:
-                wheel_ver = "cu124"
-            elif cuda_num >= 121:
-                wheel_ver = "cu121"
-            elif cuda_num >= 118:
-                wheel_ver = "cu118"
-            else:
-                wheel_ver = "cu121"  # Minimum supported
+            # Highest supported index for this driver (or the oldest index
+            # for drivers below every threshold - cu118 covers CUDA 11.x)
+            wheel_ver = next(
+                (wheel for threshold, wheel in self.CUDA_WHEEL_MAP
+                 if cuda_num >= threshold),
+                self.CUDA_WHEEL_MAP[-1][1],
+            )
 
             logger.info(f"Detected CUDA {cuda_version}, using PyTorch {wheel_ver}")
             return f"https://download.pytorch.org/whl/{wheel_ver}"
 
         except (ValueError, IndexError) as e:
             logger.warning(f"Could not parse CUDA version '{cuda_version}': {e}")
-            return "https://download.pytorch.org/whl/cu121"
+            return f"https://download.pytorch.org/whl/{self.DEFAULT_CUDA_WHEEL}"
 
     def _install_pytorch_rocm(self):
         """Install PyTorch + Keras for ROCm.
@@ -695,15 +798,17 @@ class VenvBuilder:
         logger.info(f"Installing PyTorch for ROCm {rocm_version or 'unknown'} (using {wheel_url})")
 
         subprocess.run(
-            [str(self.pip_path), 'install', 'torch', 'torchvision',
+            [str(self.pip_path), 'install',
+             self._pin('torch', 'torch'),
+             self._pin('torchvision', 'torchvision'),
              '--index-url', wheel_url],
             check=True
         )
         logger.info("PyTorch (ROCm) installed")
 
-        # Install Keras 3.x
+        # Install Keras 3.x (pinned to the probed version when available)
         subprocess.run(
-            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            [str(self.pip_path), 'install', self._pin('keras', 'keras>=3.0.0')],
             check=True
         )
         logger.info("Keras installed")
@@ -711,15 +816,17 @@ class VenvBuilder:
     def _install_pytorch_cpu(self):
         """Install PyTorch + Keras for CPU."""
         subprocess.run(
-            [str(self.pip_path), 'install', 'torch', 'torchvision',
+            [str(self.pip_path), 'install',
+             self._pin('torch', 'torch'),
+             self._pin('torchvision', 'torchvision'),
              '--index-url', 'https://download.pytorch.org/whl/cpu'],
             check=True
         )
         logger.info("PyTorch (CPU) installed")
 
-        # Install Keras 3.x
+        # Install Keras 3.x (pinned to the probed version when available)
         subprocess.run(
-            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            [str(self.pip_path), 'install', self._pin('keras', 'keras>=3.0.0')],
             check=True
         )
         logger.info("Keras installed")
@@ -727,14 +834,15 @@ class VenvBuilder:
     def _install_tensorflow_cuda(self):
         """Install TensorFlow + Keras for CUDA."""
         subprocess.run(
-            [str(self.pip_path), 'install', 'tensorflow[and-cuda]'],
+            [str(self.pip_path), 'install',
+             self._pin('tensorflow', 'tensorflow[and-cuda]')],
             check=True
         )
         logger.info("TensorFlow (CUDA) installed")
 
         # Keras is included with TensorFlow, but ensure >=3.0
         subprocess.run(
-            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            [str(self.pip_path), 'install', self._pin('keras', 'keras>=3.0.0')],
             check=True
         )
         logger.info("Keras installed")
@@ -742,14 +850,15 @@ class VenvBuilder:
     def _install_tensorflow_cpu(self):
         """Install TensorFlow + Keras for CPU."""
         subprocess.run(
-            [str(self.pip_path), 'install', 'tensorflow-cpu'],
+            [str(self.pip_path), 'install',
+             self._pin('tensorflow-cpu', 'tensorflow-cpu')],
             check=True
         )
         logger.info("TensorFlow (CPU) installed")
 
         # Keras is included with TensorFlow, but ensure >=3.0
         subprocess.run(
-            [str(self.pip_path), 'install', 'keras>=3.0.0'],
+            [str(self.pip_path), 'install', self._pin('keras', 'keras>=3.0.0')],
             check=True
         )
         logger.info("Keras installed")
@@ -930,17 +1039,40 @@ class VenvBuilder:
         logger.info("Installing remaining dependencies...")
 
         # Locate requirements.txt by convention - no hardcoded repository layout:
-        #   1. next to the target venv (the venv is created inside the project root)
-        #   2. in the current working directory (the script is run from the project root)
-        candidates = [
+        #   1. explicitly provided requirements path (requirements_path)
+        #   2. next to the target venv (the venv is created inside the project root)
+        #   3. in the current working directory (the script is run from the project root)
+        #   4. next to the invoking script (e.g. test_venv_builder.py in the
+        #      project root, invoked from anywhere)
+        candidates = []
+        if self.requirements_path is not None:
+            candidates.append(Path(self.requirements_path).resolve())
+        candidates.extend([
             Path(self.venv_path).resolve().parent / 'requirements.txt',
             Path.cwd() / 'requirements.txt',
-        ]
+        ])
+        try:
+            script_dir = Path(sys.argv[0]).resolve().parent
+            if script_dir not in (Path.cwd(), Path(self.venv_path).resolve().parent):
+                candidates.append(script_dir / 'requirements.txt')
+        except (OSError, IndexError):
+            pass
+        # De-duplicate while preserving order
+        candidates = list(dict.fromkeys(candidates))
+
         req_file = next((c for c in candidates if c.is_file()), None)
 
         if req_file is None:
-            logger.warning(f"Requirements not found. Looked in: {[str(c) for c in candidates]}")
+            # A missing requirements file silently produced incomplete venvs;
+            # this is a real error, not a cosmetic warning
+            logger.error(
+                "requirements.txt not found - project dependencies will NOT be "
+                f"installed. Looked in: {[str(c) for c in candidates]}"
+            )
             return
+
+        if self.requirements_path is not None:
+            logger.info(f"Using requirements file: {req_file}")
 
         # Skip packages bundled with PyTorch
         pytorch_packages = {'sympy', 'jinja2', 'networkx', 'fsspec',
@@ -954,16 +1086,10 @@ class VenvBuilder:
             if not line or line.startswith('#'):
                 continue
 
-            pkg_name = line.split('>=')[0].split('==')[0].split('<')[0].lower().replace('_', '-')
+            pkg_name = (line.split('>=')[0].split('==')[0].split('<')[0]
+                        .split('~=')[0].split('[')[0].lower().replace('_', '-'))
 
-            if pkg_name == 'numpy':
-                # Pin numpy<2 for PyTorch compatibility
-                logger.info("Pinning numpy<2")
-                subprocess.run(
-                    [str(self.pip_path), 'install', 'numpy<2'],
-                    check=False
-                )
-            elif pkg_name not in pytorch_packages:
+            if pkg_name not in pytorch_packages:
                 logger.info(f"Installing {line}")
                 subprocess.run(
                     [str(self.pip_path), 'install', line],
@@ -1037,51 +1163,37 @@ class VenvBuilder:
         missing = []
 
         if gpu_type == 'cuda':
-            # Check for nvidia-smi (drivers)
+            # The only hard prerequisite is a working NVIDIA driver: the
+            # PyTorch/TensorFlow wheels bundle the CUDA runtime and cuDNN,
+            # and nvcc is only needed to COMPILE CUDA code - not to run the
+            # frameworks. (The old system-cuDNN and nvcc checks probed
+            # Linux-only paths, always failing on Windows/WSL and producing
+            # false "prerequisites missing" warnings.)
             try:
                 result = subprocess.run(['nvidia-smi'], capture_output=True, timeout=5)
-                if result.returncode != 0:
+                if result.returncode != 0 and not Path('/usr/lib/wsl/lib/nvidia-smi').exists():
                     missing.append("NVIDIA drivers (nvidia-smi failed)")
-            except FileNotFoundError:
-                missing.append("nvidia-smi not found - NVIDIA drivers not installed")
             except subprocess.TimeoutExpired:
                 missing.append("nvidia-smi timeout - driver issue?")
-
-            # Check for nvcc (CUDA toolkit)
-            try:
-                result = subprocess.run(['nvcc', '--version'], capture_output=True, timeout=5)
-                if result.returncode != 0:
-                    missing.append("CUDA toolkit (nvcc not working)")
-            except FileNotFoundError:
-                missing.append("CUDA toolkit not installed (nvcc not found)")
-
-            # Check for cuDNN (optional but recommended)
-            cudnn_path = Path('/usr/lib/x86_64-linux-gnu/libcudnn.so')
-            if not cudnn_path.exists():
-                # Also check other common locations
-                alt_paths = [
-                    Path('/usr/local/cuda/lib64/libcudnn.so'),
-                    Path('/usr/lib/aarch64-linux-gnu/libcudnn.so'),
-                ]
-                if not any(p.exists() for p in alt_paths):
-                    missing.append("cuDNN library (optional but recommended)")
+            except OSError:
+                # Not found or not executable (e.g. a Windows binary resolved
+                # via WSL PATH interop); WSL often only exposes it via
+                # /usr/lib/wsl/lib (not on PATH)
+                if not Path('/usr/lib/wsl/lib/nvidia-smi').exists():
+                    missing.append("nvidia-smi not found - NVIDIA drivers not installed")
 
         elif gpu_type == 'rocm':
-            # Check for rocm-smi
+            # Only a working ROCm driver is required - the PyTorch ROCm
+            # wheels bundle the ROCm runtime; hipcc is only for compiling
+            # ROCm code, not for running the frameworks.
             try:
                 result = subprocess.run(['rocm-smi'], capture_output=True, timeout=5)
                 if result.returncode != 0:
                     missing.append("ROCm drivers (rocm-smi failed)")
-            except FileNotFoundError:
+            except subprocess.TimeoutExpired:
+                missing.append("rocm-smi timeout - driver issue?")
+            except OSError:
                 missing.append("ROCm not installed (rocm-smi not found)")
-
-            # Check for hipcc
-            try:
-                result = subprocess.run(['hipcc', '--version'], capture_output=True, timeout=5)
-                if result.returncode != 0:
-                    missing.append("HIP compiler (hipcc not working)")
-            except FileNotFoundError:
-                missing.append("HIP toolkit not installed (hipcc not found)")
 
         elif gpu_type == 'jetson':
             # Check for JetPack
@@ -1109,8 +1221,9 @@ def create_venv_for_hardware(
     output_config_path: Optional[str] = None,
     on_fail: str = 'n',
     install_all: bool = False,
-    probe_venv_path: Optional[str] = None
-) -> tuple[Path, HardwareInfo, str, list[tuple[str, str]]]:
+    probe_venv_path: Optional[str] = None,
+    requirements_path: Optional[str] = None
+) -> tuple[Path, HardwareInfo, str, list[tuple[str, str]], bool]:
     """Create venv configured for detected hardware (probe-then-commit).
 
     Args:
@@ -1122,9 +1235,12 @@ def create_venv_for_hardware(
         probe_venv_path: Disposable probe venv (e.g. .venv-probe) where
             candidates are tested before committing into venv_path; None
             selects legacy single-venv mode (candidates probed in target)
+        requirements_path: Explicit path to the project's requirements.txt
+            (None = auto-discover; see VenvBuilder._install_remaining_deps)
 
     Returns:
-        (venv_path, hardware_info, keras_backend, all_successful_backends)
+        (venv_path, hardware_info, keras_backend, all_successful_backends,
+        verification_passed)
     """
     # Detect hardware
     detector = HardwareDetector()
@@ -1132,7 +1248,8 @@ def create_venv_for_hardware(
 
     # Create venv with probe-then-commit
     builder = VenvBuilder(venv_path, hardware_info, on_fail=on_fail,
-                          install_all=install_all, probe_venv_path=probe_venv_path)
+                          install_all=install_all, probe_venv_path=probe_venv_path,
+                          requirements_path=requirements_path)
     venv, successful_backends = builder.create()
 
     # Determine primary keras_backend from successful installs or hardware_info
@@ -1149,6 +1266,11 @@ def create_venv_for_hardware(
         # Fallback to hardware detection
         keras_backend = keras_backend_map.get(hardware_info.preferred_backend, 'torch')
 
+    # Run verification now so its result can be recorded in the config.
+    # The return value is propagated to the caller (previously discarded,
+    # which masked real failures behind a success summary).
+    verify_passed = _verify_installation(venv)
+
     # Write hardware config with keras_backend
     if output_config_path:
         import json
@@ -1158,6 +1280,7 @@ def create_venv_for_hardware(
         config = hardware_info.to_dict()
         config['keras_backend'] = keras_backend
         config['available_backends'] = [b[0] for b in successful_backends]
+        config['verification_passed'] = verify_passed
 
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=2)
@@ -1169,10 +1292,7 @@ def create_venv_for_hardware(
     # Generate keras_backend.py for model-core with all available backends
     _generate_keras_backend_py(venv_path, keras_backend, successful_backends)
 
-    # Run verification
-    _verify_installation(venv)
-
-    return venv, hardware_info, keras_backend, successful_backends
+    return venv, hardware_info, keras_backend, successful_backends, verify_passed
 
 
 def _generate_keras_backend_py(
@@ -1272,11 +1392,17 @@ def _verify_installation(venv_path: Path) -> bool:
     logger.info("Running verification checks...")
 
     try:
+        # Force UTF-8 for the child's stdout/stderr so its output never
+        # crashes on Windows consoles (cp1252); decode it accordingly.
+        child_env = {**os.environ, 'PYTHONIOENCODING': 'utf-8'}
         result = subprocess.run(
             [str(python_path), str(verify_script)],
             capture_output=True,
             text=True,
-            timeout=VERIFY_TIMEOUT
+            encoding='utf-8',
+            errors='replace',
+            timeout=VERIFY_TIMEOUT,
+            env=child_env
         )
 
         # Log output
@@ -1291,9 +1417,9 @@ def _verify_installation(venv_path: Path) -> bool:
 
         success = result.returncode == 0
         if success:
-            logger.info("✓ Verification PASSED")
+            logger.info("[OK] Verification PASSED")
         else:
-            logger.warning("✗ Verification FAILED")
+            logger.warning("[FAIL] Verification FAILED")
 
         return success
 
@@ -1325,14 +1451,20 @@ if __name__ == '__main__':
     parser.add_argument('--probe-venv', dest='probe_venv', default=None,
                         help='Disposable probe venv where candidates are tested '
                              '(default: no probe - candidates probed in target venv)')
+    parser.add_argument('--requirements', dest='requirements', default=None,
+                        help='Path to requirements.txt for the target venv '
+                             '(default: auto-discover)')
     args = parser.parse_args()
 
-    venv, hardware, keras_backend, all_backends = create_venv_for_hardware(
+    venv, hardware, keras_backend, all_backends, verify_ok = create_venv_for_hardware(
         args.venv_path, args.config, args.on_fail, args.install_all,
-        probe_venv_path=args.probe_venv
+        probe_venv_path=args.probe_venv, requirements_path=args.requirements
     )
 
-    print(f"\n✓ Virtual environment created at: {venv}")
+    if verify_ok:
+        print(f"\n[OK] Virtual environment created at: {venv}")
+    else:
+        print(f"\n[!!] Virtual environment created at: {venv} - verification FAILED")
     print(f"  Hardware: {hardware.gpu_type or 'CPU-only'}")
     print(f"  GPU: {hardware.gpu_name or 'N/A'}")
     print(f"  Primary Keras Backend: {keras_backend}")
@@ -1349,3 +1481,6 @@ if __name__ == '__main__':
         print(f"  {venv}\\Scripts\\activate")
     else:
         print(f"  source {venv}/bin/activate")
+
+    # Non-zero exit code when verification failed so scripts/CI can detect it
+    sys.exit(0 if verify_ok else 1)

@@ -243,14 +243,23 @@ model-setup logs exactly why GPU setup fails. Check the log file for details:
 
 ### CUDA Prerequisites Check
 
+Only a working NVIDIA driver (`nvidia-smi`) is required - the PyTorch and
+TensorFlow wheels bundle the CUDA runtime and cuDNN, and nvcc is only
+needed to compile CUDA code, not to run the frameworks:
+
 ```
 INFO - Detecting hardware on Linux x86_64
 INFO - WSL environment detected
 INFO - CUDA GPU detected
+INFO - NVIDIA driver reports CUDA 13.2
+INFO - All cuda prerequisites satisfied
+```
+
+If the driver is missing:
+
+```
 WARNING - CUDA prerequisites missing:
 WARNING -   - nvidia-smi not found - NVIDIA drivers not installed
-WARNING -   - CUDA toolkit not installed (nvcc not found)
-WARNING -   - cuDNN library (optional but recommended)
 INFO - Will attempt install anyway, but may fail
 ```
 
@@ -259,7 +268,6 @@ INFO - Will attempt install anyway, but may fail
 ```
 WARNING - ROCm prerequisites missing:
 WARNING -   - ROCm not installed (rocm-smi not found)
-WARNING -   - HIP toolkit not installed (hipcc not found)
 ```
 
 ### Log File Locations
