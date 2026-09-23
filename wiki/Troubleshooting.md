@@ -6,12 +6,13 @@ Common issues and solutions for model-setup.
 
 1. [Checking Logs](#checking-logs)
 2. [WSL Issues](#wsl-issues)
-3. [GPU Prerequisites Missing](#gpu-prerequisites-missing)
-4. [Import Errors](#import-errors)
-5. [GPU Not Detected](#gpu-not-detected)
-6. [Library Loading Errors](#library-loading-errors)
-7. [Version Conflicts](#version-conflicts)
-8. [Installation Failures](#installation-failures)
+3. [Cross-Platform Venv Reuse](#cross-platform-venv-reuse-windowswsl-shared-folder)
+4. [GPU Prerequisites Missing](#gpu-prerequisites-missing)
+5. [Import Errors](#import-errors)
+6. [GPU Not Detected](#gpu-not-detected)
+7. [Library Loading Errors](#library-loading-errors)
+8. [Version Conflicts](#version-conflicts)
+9. [Installation Failures](#installation-failures)
 
 ## Checking Logs
 
@@ -83,6 +84,51 @@ wsl --update
 # Then restart WSL
 wsl --shutdown
 ```
+
+## Cross-Platform Venv Reuse (Windows/WSL Shared Folder)
+
+### "FileNotFoundError: No such file or directory: 'venv/bin/pip'"
+
+**Cause**: Running model-setup from WSL/Linux against a target venv that was
+created by Windows Python in a shared folder
+(`C:\Users\you\Documents\ai` is `/mnt/c/Users/you/Documents/ai` in WSL),
+or the reverse - a Windows run reusing a WSL/Linux venv fails the same way
+looking for `venv\Scripts\pip.exe`. A venv is platform-specific: Windows
+uses `venv\Scripts\pip.exe` while Linux/WSL use `venv/bin/pip`, and
+framework wheels are compiled per platform, so the two flows cannot share
+one venv.
+
+model-setup checks this at the very start of the run (before any packages
+are installed or probed) and fails fast with a clear message:
+
+```text
+ERROR - Existing venv 'venv' was created by Windows Python (pip found at
+'venv/Scripts/pip.exe') and cannot be reused from Linux/macOS/WSL ...
+```
+
+Without this check the run instead crashes much later with
+`FileNotFoundError: [Errno 2] No such file or directory: 'venv/bin/pip'`.
+
+**Solution**: Give each platform its own venv name in the shared folder:
+
+```bash
+# From WSL - separate venv name for the Linux side
+python3 test_venv_builder.py venv-wsl --model-setup-wheel model_setup-0.3.0-py3-none-any.whl
+
+# From Windows - keep using 'venv'
+python test_venv_builder.py venv --model-setup-wheel model_setup-0.3.0-py3-none-any.whl
+```
+
+Or delete the foreign venv and re-run (only if it is no longer needed on
+the other platform):
+
+```bash
+# From WSL - removes the Windows venv
+rm -rf /mnt/c/Users/you/Documents/ai/venv
+```
+
+> **Note**: The disposable probe venv (`.venv-probe`) does not have this
+> problem - the test flow sweeps and recreates it fresh on every run.
 
 ## GPU Prerequisites Missing
 

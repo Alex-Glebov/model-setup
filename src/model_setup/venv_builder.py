@@ -160,6 +160,51 @@ class VenvBuilder:
         self._active_venv = Path(venv_path)
         self._pip_path = None  # recompute for the newly active venv
 
+    def _validate_existing_venv(self, venv_path: Path):
+        """Fail fast if an existing venv cannot be reused on this platform.
+
+        A venv is platform-specific: Windows uses Scripts\\pip.exe while
+        Linux/macOS/WSL use bin/pip, and framework wheels are compiled
+        per platform. Reusing a venv created on the other platform
+        (typically Windows Python vs WSL sharing one folder) would
+        otherwise fail much later with a cryptic FileNotFoundError.
+        The venv is never deleted automatically - this only reports it.
+        """
+        if platform.system() == 'Windows':
+            current_pip = venv_path / 'Scripts' / 'pip.exe'
+            foreign_pip = venv_path / 'bin' / 'pip'
+            current_side = 'Windows'
+            foreign_side = 'Linux/macOS/WSL'
+        else:
+            current_pip = venv_path / 'bin' / 'pip'
+            foreign_pip = venv_path / 'Scripts' / 'pip.exe'
+            current_side = 'Linux/macOS/WSL'
+            foreign_side = 'Windows'
+
+        if current_pip.exists():
+            return  # platform layout matches - safe to reuse
+
+        if foreign_pip.exists():
+            message = (
+                f"Existing venv '{venv_path}' was created by {foreign_side} "
+                f"Python (pip found at '{foreign_pip}') and cannot be "
+                f"reused from {current_side} (this platform expects "
+                f"'{current_pip}'). Virtual environments are "
+                "platform-specific. Re-run with a separate venv path for "
+                f"this platform, or delete '{venv_path}' and re-run to "
+                "rebuild it for this platform."
+            )
+            logger.error(message)
+            raise RuntimeError(message)
+
+        message = (
+            f"Existing venv '{venv_path}' has no usable pip at "
+            f"'{current_pip}' (corrupted, created without pip, or not a "
+            f"real venv). Delete '{venv_path}' and re-run to rebuild it."
+        )
+        logger.error(message)
+        raise RuntimeError(message)
+
     def create(self) -> tuple[Path, list[tuple[str, str]]]:
         """Create or update the target venv using probe-then-commit.
 
@@ -193,6 +238,14 @@ class VenvBuilder:
         logger.info(f"Target venv (persistent - never deleted): {self.venv_path}")
         logger.info("=" * 60)
 
+        # Fail fast, before any probing: if the target venv already
+        # exists it must be usable from this platform (a Windows venv
+        # cannot be updated from WSL and vice versa). Without this check
+        # the whole probe phase would run first and the mismatch would
+        # only surface later, when the commit phase first invokes pip.
+        if self.venv_path.exists():
+            self._validate_existing_venv(self.venv_path)
+
         if self.probe_venv_path is not None:
             # ---- Phase 1: probe candidates in the disposable probe venv ----
             self._use_venv(self.probe_venv_path)
@@ -201,6 +254,7 @@ class VenvBuilder:
                 logger.info(f"Created probe venv at {self.probe_venv_path}")
             else:
                 logger.info(f"Reusing probe venv at {self.probe_venv_path}")
+                self._validate_existing_venv(self.probe_venv_path)
             # Full-fidelity dry run: same requirements pass as the commit phase
             self._install_remaining_deps()
             self._successful_backends = self._probe_candidates()
@@ -208,6 +262,7 @@ class VenvBuilder:
             # Legacy single-venv mode: probe directly in the target venv
             if self.venv_path.exists():
                 logger.info(f"Reusing existing venv at {self.venv_path} (never deleted; updated in place)")
+                self._validate_existing_venv(self.venv_path)
             else:
                 self._create_venv(self.venv_path)
                 logger.info(f"Created venv at {self.venv_path}")
@@ -323,6 +378,7 @@ class VenvBuilder:
         self._use_venv(self.venv_path)
         if self.venv_path.exists():
             logger.info(f"Reusing existing venv at {self.venv_path} (never deleted; updated in place)")
+            self._validate_existing_venv(self.venv_path)
             self._setup_venv_logging(self.venv_path)
         else:
             self._create_venv(self.venv_path)
